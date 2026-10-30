@@ -1,0 +1,4 @@
+# 记忆整理状态看板：一行常驻提示，无异常时零输出。
+- insert:
+    - id: memory-status
+      name: '@local/dsh-memory'

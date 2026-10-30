@@ -1,0 +1,10 @@
+# worker 运行日志（机器相关，不入库）
+tools/tidy.log
+*.log.tmp
+
+# 本地运行数据与个人交接文档，不进仓库
+.tidy/
+tools/backup/
+SESSION-PROMPT.md
+
+node_modules/
