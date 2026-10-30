@@ -5,6 +5,14 @@
   "type": "module",
   "description": "记忆系统：设置页「记忆管理」+ 给模型一行中立状态",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mounta1n-18/dsh-memory.git"
+  },
+  "homepage": "https://github.com/mounta1n-18/dsh-memory#readme",
+  "bugs": {
+    "url": "https://github.com/mounta1n-18/dsh-memory/issues"
+  },
   "icon": "./icon.svg",
   "exports": {
     ".": "./index.js",
