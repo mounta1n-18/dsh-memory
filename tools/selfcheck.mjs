@@ -278,8 +278,11 @@ ok(
 );
 ok('裁剪后长度不超过上限+省略号', Array.from(plMem.slice('pl-mem='.length)).length <= 43, `${Array.from(plMem.slice('pl-mem='.length)).length} 字`);
 
-// 有「教训/」条目时，大纲末尾必须带前置检查指令
-ok('大纲带教训前置检查', /动手前先过一遍【教训】/.test(outline), outline.slice(-120));
+// 有「教训/」条目时，大纲必须自带「什么时候必须先读」+ 末尾前置检查：
+// 召回率不靠模型自觉，靠索引里写清动作触发条件。
+ok('大纲开头给动词触发清单', /什么时候必须先读/.test(outline) && /动手改文件/.test(outline));
+ok('大纲提示可一次读多条', /可一次传多个/.test(outline));
+ok('大纲带教训前置检查', /就先 memory_read 读完再动手/.test(outline), outline.slice(-120));
 
 console.log('\n[3] 闸门按路径身份');
 const body = path.join(MEM, 'pl-perm.md');
@@ -346,9 +349,13 @@ eq('失败原因透传', r.body.detail, '模型超时');
 console.log('\n[5] 首关键词硬约束');
 const write = state.tools.get('memory_write');
 ok(
-  '教训关键词要求写场景而不是症状名',
-  /不要写 400、422/.test(write.description) && /犯这个错之前/.test(write.description),
+  '教训关键词要求写犯错前的动作',
+  /犯这个错\*\*之前\*\*/.test(write.description) && /让读者一眼认出/.test(write.description),
   write.description.slice(0, 80),
+);
+ok(
+  '教训关键词明确禁止事后症状/错误码',
+  /不要写事后症状、错误码或根因/.test(write.description) && /教训\/422/.test(write.description),
 );
 ok('教训正文要求写场景/链条/修复三段', /错误链条/.test(write.description) && /绕开与修复/.test(write.description));
 const mk = (keywords) => ({ name: 'tmp-check', keywords, description: '自检用', body: '自检正文' });
@@ -376,6 +383,32 @@ try {
   threw = err.message;
 }
 ok('memory_update 改关键词也校验', /不是合法分类/.test(threw), threw);
+// 教训关键词的预防性校验：症状名/错误码一律拒，动作短语放行
+threw = '';
+try {
+  write.execute({ name: 'tmp-bad', keywords: '教训/422 报错', description: '自检', body: '自检正文' });
+} catch (err) {
+  threw = err.message;
+}
+ok('教训关键词写症状名被拒', /不能写事后症状/.test(threw), threw);
+threw = '';
+try {
+  update.execute({ name: 'tmp-check', keywords: '教训/根因是缺 role' });
+} catch (err) {
+  threw = err.message;
+}
+ok('memory_update 同样拦症状名', /不能写事后症状/.test(threw), threw);
+ok(
+  '被拒时正文没被改（先校验后落盘）',
+  fs.readFileSync(path.join(MEM, 'tmp-check.md'), 'utf8').includes('自检正文'),
+);
+const actOk = write.execute({
+  name: 'tmp-act',
+  keywords: '教训/批量删除家目录/清理缓存目录',
+  description: '自检用',
+  body: '自检正文',
+});
+ok('动作短语放行', /已记下/.test(actOk.text), actOk.text.slice(0, 60));
 
 // 正文长度：2000 字以内静默，超过只提一句（用户口径 2026-10-28：别用「警告」把人吓短）
 const shortBody = write.execute({ name: 'len-short', keywords: '其它/长度自检', description: '自检', body: '甲'.repeat(600) });
@@ -425,6 +458,31 @@ const mcd = r.body.entries.find((e) => e.file === 'pl-mcd.md');
 eq('回忆率 = 1/5 = 20%', mcd.recallRate, 20);
 const btw = r.body.entries.find((e) => e.file === 'pl-btw.md');
 eq('没回忆过 = 0%', btw.recallRate, 0);
+
+console.log('\n[6a] 一次读多条 + 整体召回率');
+const batch = read.execute({ file: 'pl-btw、noahs-ark,pl-mem' });
+ok(
+  '一次取回三条正文',
+  /【记忆：pl-btw】/.test(batch.text) && /【记忆：noahs-ark】/.test(batch.text) && /【记忆：pl-mem】/.test(batch.text),
+  batch.text.slice(0, 40),
+);
+eq('多条之间分段', (batch.text.match(/———/g) || []).length, 2);
+const dup2 = read.execute({ file: 'pl-btw、pl-btw' });
+eq('同一文件两种叫法只读一次', (dup2.text.match(/【记忆：pl-btw】/g) || []).length, 1);
+const partial = read.execute({ file: 'pl-btw、zznope' });
+ok('缺的一条汇总在末尾，不整单失败', /没找到：zznope/.test(partial.text) && /【记忆：pl-btw】/.test(partial.text));
+let allMiss = '';
+try {
+  read.execute({ file: 'zznope' });
+} catch (err) {
+  allMiss = err.message;
+}
+ok('全都没找到时仍报错', /没有找到记忆/.test(allMiss), allMiss.slice(0, 40));
+r = await call(state, '/dsh-memory/status');
+const ov = r.body.recall;
+ok('整体召回率按轮算', ov && ov.window === 5 && ov.anyTurns === 2, JSON.stringify(ov));
+ok('本轮读了 4 条 → 覆盖率 4', ov.covered === 4, JSON.stringify(ov.covered));
+ok('教训召回率单独给（第 5 轮读了 noahs-ark）', ov.lessonTurns === 1 && ov.lessonRate === 20, JSON.stringify(ov));
 
 console.log('\n[6b] 记忆调用流水（供「记忆」视图）');
 const runPost = (name, args, sessionId) =>

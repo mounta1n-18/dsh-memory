@@ -182,6 +182,41 @@ function recallRates() {
   return out;
 }
 
+/**
+ * 整体召回率：单条百分比永远很低（一条记忆在一次任务里读完就够了），
+ * 看单个数字会误判成「机制坏了」。这里给三个更有意义的量：
+ * - anyRate：窗口内有任何回忆的轮次占比（这一轮到底有没有想起记忆）
+ * - lessonRate：同一口径，只算读了【教训】的轮次（预防性回忆有没有发生）
+ * - covered：窗口内被读过的记忆条数 / 启用总数（覆盖面）
+ */
+function recallOverview() {
+  const size = Math.min(WINDOW_TURNS, turnCount);
+  if (!size) return null;
+  const fromTurn = turnCount - size + 1;
+  const entries = readEntries();
+  const lessonFiles = new Set(entries.filter((e) => /^教训\//.test(e.keywords || '')).map((e) => e.file));
+  const live = entries.filter((e) => e.enabled);
+  const anyTurns = new Set();
+  const lessonTurns = new Set();
+  const files = new Set();
+  const events = readJson(RECALL, []);
+  for (const ev of Array.isArray(events) ? events : []) {
+    if (!ev || typeof ev.turn !== 'number' || ev.turn < fromTurn || ev.turn > turnCount) continue;
+    anyTurns.add(ev.turn);
+    files.add(ev.file);
+    if (lessonFiles.has(ev.file)) lessonTurns.add(ev.turn);
+  }
+  return {
+    window: size,
+    anyTurns: anyTurns.size,
+    anyRate: Math.round((anyTurns.size / size) * 100),
+    lessonTurns: lessonTurns.size,
+    lessonRate: lessonFiles.size ? Math.round((lessonTurns.size / size) * 100) : null,
+    covered: files.size,
+    total: live.length,
+  };
+}
+
 /** 首关键词就是分类；缺了或不在表里返回空串。 */
 function categoryOf(keywords) {
   const head = String(keywords || '').split('/')[0].trim();
@@ -203,6 +238,30 @@ function assertCategory(keywords, { allowManual = false } = {}) {
   if (!CATEGORIES.includes(head)) {
     throw new Error(`第一个关键词「${head}」不是合法分类，只能是：资料 / 教训 / 说明书 / 其它（${MANUAL_CATEGORY} 仅手动）`);
   }
+}
+
+/**
+ * 教训关键词的「预防性」校验（2026-11-09 用户口径）：
+ * 关键词的作用是让未来的模型看见它、意识到自己下一步可能闯祸，从而先展开回忆。
+ * 所以它必须写「犯错之前的任务与动作」，写成事后症状/错误码/根因就等于没写——
+ * 那些词只在修完 bug 时才出现在脑子里，挡不住下一次。
+ */
+const LESSON_SYMPTOM_WORDS =
+  /\b[1-5]\d{2}\b|\b[45]xx\b|报错|错误码|错误|失败|崩溃|白屏|黑屏|卡死|挂掉|不生效|不工作|失效|异常|\bbug\b|根因|修复|修好|超时|冲突|缺字段|missing|error|exception/i;
+
+function lessonKeywordProblem(keywords) {
+  const parts = String(keywords || '')
+    .split('/')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (parts[0] !== '教训') return null;
+  const bad = parts.slice(1).filter((p) => LESSON_SYMPTOM_WORDS.test(p));
+  if (!bad.length) return null;
+  return [
+    `教训的关键词要写「犯这个错之前你正在做的动作」，不能写事后症状/错误码/根因：你现在写的是「${bad.join('、')}」。`,
+    '这类词在你真要犯错的那一刻不会出现在脑子里；那一刻只有「我正在删除这个目录」「我正在往会话里注入消息」这种动作。',
+    '换成动作短语重试，例如：教训/批量删除家目录、教训/往会话注入消息、教训/改运行中profile、教训/装完插件直接验收、教训/截断工具返回的长文本。',
+  ].join('');
 }
 
 /**
@@ -656,11 +715,13 @@ let compressRunning = false;
  */
 const WRITE_TOOL_DESCRIPTION = [
   '记住一件以后还会用到的事。任务收尾时过一遍：有没有新的稳定事实、可复用的做法、或一次纠正？有就写一条，最多一条。',
-  '首词是分类：资料 / 教训 / 说明书 / 其它（项目记忆 只由用户点「大脑」按钮生成）。后面的词决定「以后什么情况下能想起它」：',
-  '· 资料 写内容类型（资料/身份/联系方式），不要只写人名；',
-  '· 说明书 写工具名（说明书/btw插件）；',
-  '· 教训 先想清「犯这个错之前我正在做什么任务、什么动作」，再把那个场景写进关键词（教训/插件往会话注入消息、教训/截断长文本）。',
-  '  不要写 400、422、报错 这类事后症状名——那是修复时的抓手，不是预防的触发词。',
+  '首词是分类：资料 / 教训 / 说明书 / 其它（项目记忆 只由用户点「大脑」按钮生成）。',
+  'keywords 决定的不是「这条记忆讲什么」，而是「以后你在做什么动作时该想起它」——它是写给未来自己的触发条件：',
+  '· 教训 写犯这个错**之前**你正在做的任务与动作，让读者一眼认出「我下一步要干的就是这个」：教训/批量删除家目录、教训/往会话注入消息、教训/改运行中profile、教训/装完插件直接验收。',
+  '  不要写事后症状、错误码或根因：教训/422、教训/报错、教训/根因是缺 role —— 你真正要犯错时，脑子里不会出现这些词。',
+  '· 资料 写内容类型（资料/身份/联系方式），不要只写人名。',
+  '· 说明书 写工具名（说明书/btw插件），写「我要用它」时脑子里蹦出来的那个名字。',
+  '· 每条 1~5 个词，用 / 分隔；可补 1~2 个同义说法（口语版），覆盖不同的叫法。',
   '关键词用完整、泛化的短语；可被想起比检索精度重要。',
   '写「教训」时 body 必须三段，缺一段就没有预防作用：① 场景（什么任务、什么动作会踩到，读者一看就知道「我现在正在这个场景里」）；② 错误链条（第一步做什么、哪步开始不对、为什么没察觉）；③ 绕开与修复（下次怎么走、已部署什么防护）。',
 ].join(' ');
@@ -672,7 +733,7 @@ const WRITE_TOOL_PARAMETERS = {
     keywords: {
       type: 'string',
       description:
-        '1~5 个词，用 / 分隔，首词是分类。资料写内容类型（资料/身份/联系方式），教训写犯错前的场景/任务（教训/插件往会话注入消息），说明书写工具名（说明书/btw插件）；不要写 400、422 这类事后症状名。',
+        '1~5 个词用 / 分隔，首词是分类。写「以后什么动作该想起它」而不是「这条讲什么」：教训写犯错前的任务/动作（教训/批量删除家目录、教训/往会话注入消息），资料写内容类型（资料/身份/联系方式），说明书写工具名（说明书/btw插件）。教训里禁止写 422、报错、根因 这类事后症状。',
     },
     description: { type: 'string', description: '一句话说清这是什么、什么时候该读。' },
     body: { type: 'string', description: '正文，Markdown，写完整句子；2000 字以内通常够用，内容确实需要可以更长。' },
@@ -1366,7 +1427,8 @@ function outlineText(entries = readEntries()) {
     return CATEGORIES.includes(head) ? head : '未分类';
   };
   const lines = [
-    '记忆索引（每条「名称=关键词」；关键词写的是「以后什么场景该想起它」，要正文就 memory_read，传名称或关键词都行）',
+    '记忆索引（名称=关键词）。关键词写的是「你接下来要做什么动作时该想起它」，不是这条记忆讲什么。要正文用 memory_read，可一次传多个（file:"a、b"）。',
+    '什么时候必须先读：① 动手改文件 / 删东西 / 装或卸插件 / 跑命令之前，先扫一遍【教训】——关键词说的是「会闯祸的动作」，跟你接下来要干的相近就先读；② 用户提到过去的事、或要接手旧任务，先扫对应分类；③ 拿不准就查：查错只花一次工具调用，漏查要返工。',
   ];
   for (const [cat] of OUTLINE_GROUPS) {
     const rows = live
@@ -1383,7 +1445,9 @@ function outlineText(entries = readEntries()) {
   }
   // 有教训就有前置检查：教训的关键词写的是「犯错前的场景」，读者必须在动手前对一遍。
   if (live.some((e) => /^教训\//.test(e.keywords))) {
-    lines.push('动手前先过一遍【教训】：这次任务命中哪个场景，就先 memory_read 读完再开始，不要等报了错才回来找。');
+    lines.push(
+      '【教训】的关键词是「会闯祸的动作」：只要命中你下一步要做的事，就先 memory_read 读完再动手，不要等报了错才回来找。',
+    );
   }
   return lines.join('\n');
 }
@@ -1459,6 +1523,7 @@ function snapshot() {
     keyConfigured: key,
     turns: turnCount,
     windowTurns: windowSize,
+    recall: recallOverview(),
     compress: {
       running,
       interrupted: unfinished && !running,
@@ -1609,8 +1674,9 @@ export function apply(ctx) {
         toolCtx.tools.register({
           name: 'memory_read',
           description: [
-            '读取一份记忆的正文。上下文里有一行「记忆 ▸ 名称=关键词」，先在那一行里挑和当前任务对得上的名称或关键词，再用本工具取原文。',
-            '「教训/」开头的条目是**动手前**必查的：只要它的场景落进你这次要做的事，先读它、再动手；不要等报了错才回来找。',
+            '读取记忆正文。上下文里有一行「记忆 ▸ 名称=关键词」，先按关键词挑出和当前任务对得上的，再用本工具取原文。',
+            '可以一次读多条：file 用「、」或逗号分隔（如 "noahs-ark、审计日志"），比一条条读省调用、也更适合「动手前先把相关教训都扫一遍」。',
+            '「教训/」开头的条目是**动手前**必查的：只要它的动作场景落进你这次要做的事，先读它、再动手；不要等报了错才回来找。',
             '不要用 read / grep / glob / 命令行去翻记忆仓库：插件会拒绝，而且那样更慢。',
             'file 传大纲里的名称（如 user-profile），也可以传一个关键词（如 身份）。',
           ].join(' '),
@@ -1619,7 +1685,7 @@ export function apply(ctx) {
             properties: {
               file: {
                 type: 'string',
-                description: '大纲里的记忆名称（可带或不带 .md），或一个关键词。',
+                description: '大纲里的记忆名称（可带或不带 .md），或一个关键词；多条用「、」或「,」分隔，最多 6 条。',
               },
             },
             required: ['file'],
@@ -1637,20 +1703,38 @@ export function apply(ctx) {
             },
           },
           execute(args) {
-            const query = String(args?.file || '').trim();
-            if (!query) throw new Error('需要 file：取大纲里的记忆名称或关键词');
-            const entry = resolveEntry(query);
-            if (!entry) {
+            const raw = Array.isArray(args?.file) ? args.file.join('、') : String(args?.file || '');
+            const queries = raw
+              .split(/[、,;；\n]+/)
+              .map((s) => s.trim())
+              .filter(Boolean);
+            if (!queries.length) throw new Error('需要 file：取大纲里的记忆名称或关键词（多条用「、」分隔）');
+            const picked = [];
+            const missing = [];
+            for (const q of queries.slice(0, 20)) {
+              const entry = resolveEntry(q);
+              if (!entry) {
+                missing.push(q);
+                continue;
+              }
+              // 同一个文件被两种叫法点到，只读一次
+              if (!picked.some((p) => p.file === entry.file)) picked.push(entry);
+              if (picked.length >= 6) break;
+            }
+            if (!picked.length) {
               const names = readEntries()
                 .filter((e) => e.enabled)
                 .map((e) => e.file.replace(/\.md$/i, ''))
                 .join('、');
-              throw new Error(`没有找到记忆「${query}」。可用的有：${names || '（无）'}`);
+              throw new Error(`没有找到记忆「${missing.join('、')}」。可用的有：${names || '（无）'}`);
             }
-            const body = readMemoryBody(entry.file);
-            const name = entry.file.replace(/\.md$/i, '');
-            recordRecall(entry.file); // 回忆率就靠这一行统计，读完才记
-            return { text: `【记忆：${name}】\n\n${body}` };
+            const chunks = picked.map((entry) => {
+              const name = entry.file.replace(/\.md$/i, '');
+              recordRecall(entry.file); // 回忆率就靠这一行统计，读完才记
+              return `【记忆：${name}】\n\n${readMemoryBody(entry.file)}`;
+            });
+            const tail = missing.length ? `\n\n（没找到：${missing.join('、')}）` : '';
+            return { text: chunks.join('\n\n———\n\n') + tail };
           },
         }),
       'memory read tool',
@@ -1682,6 +1766,8 @@ export function apply(ctx) {
             if (!keywords) throw new Error('keywords 不能为空，否则大纲里点不到它');
             // 「项目记忆」只由 /remember 或设置页新建产生，模型通道一律拒绝。
             assertCategory(keywords);
+            const kwProblem = lessonKeywordProblem(keywords);
+            if (kwProblem) throw new Error(kwProblem);
             if (!description) throw new Error('description 不能为空，一句话说清什么时候读');
             if (!body) throw new Error('body 不能为空');
             const attrs = [`name: ${name}`, `description: ${description}`, `type: ${type}`, `reviewed: ${today()}`];
@@ -1748,12 +1834,15 @@ export function apply(ctx) {
             setAttr(attrs, 'reviewed', today());
             const body = args?.body ? String(args.body).trim() : doc.body;
             if (!body) throw new Error('body 不能为空');
-            fs.writeFileSync(path.join(MEM, file), joinDoc(attrs, body), 'utf8');
-            if (args?.keywords) {
-              const nextKeywords = oneLine(args.keywords, 80);
+            // 关键词先校验再落盘：否则正文改了、关键词被拒，留下半截修改
+            const nextKeywords = args?.keywords ? oneLine(args.keywords, 80) : '';
+            if (nextKeywords) {
               assertCategory(nextKeywords); // 换关键词也要守住分类
-              updateCell(file, 2, nextKeywords);
+              const kwProblem = lessonKeywordProblem(nextKeywords);
+              if (kwProblem) throw new Error(kwProblem);
             }
+            fs.writeFileSync(path.join(MEM, file), joinDoc(attrs, body), 'utf8');
+            if (nextKeywords) updateCell(file, 2, nextKeywords);
             if (args?.type) updateCell(file, 4, oneLine(args.type, 24));
             if (args?.description) updateCell(file, 5, oneLine(args.description));
             updateCell(file, 6, today());

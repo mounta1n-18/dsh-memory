@@ -1951,6 +1951,34 @@ window.__ModuleLoader__.load({
               ),
             )
           : null,
+        // 单条「回忆率」永远偏低（一条记忆一次任务读一次就够），光看它会误以为机制坏了。
+        // 顶部给整体口径：窗口内多少轮真的想起过记忆、覆盖了几条、教训被读了几轮。
+        data && data.recall
+          ? h(
+              'div',
+              {
+                title:
+                  '整体召回率：按「轮」算，而不是按单条记忆算。一条记忆在被需要的那一轮读一次就够了，所以单条百分比天然很低。',
+                style: {
+                  fontSize: 12,
+                  color: 'var(--dsw-alias-label-secondary)',
+                  padding: '2px 2px',
+                  display: 'flex',
+                  gap: 14,
+                  flexWrap: 'wrap',
+                },
+              },
+              h('span', null, `近 ${data.recall.window} 轮：${data.recall.anyTurns} 轮想到过记忆（${data.recall.anyRate}%）`),
+              h('span', null, `覆盖 ${data.recall.covered}/${data.recall.total} 条`),
+              h(
+                'span',
+                null,
+                data.recall.lessonRate === null
+                  ? '教训 —'
+                  : `教训 ${data.recall.lessonTurns} 轮（${data.recall.lessonRate}%）`,
+              ),
+            )
+          : null,
         groups.length
           ? groups.map((group) => {
               const isCollapsed = Boolean(collapsed[group.cat]) && !matched;
