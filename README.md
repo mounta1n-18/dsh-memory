@@ -52,7 +52,7 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
 
 **单条回忆率天然很低**（一条记忆在被需要的那一轮读一次就够，窗口 100 轮里读到 5 轮 = 5%），所以设置页顶部另给整体口径 `recallOverview()`：`anyTurns/anyRate`（窗口内多少轮真的想起过记忆）、`covered/total`（覆盖率）、`lessonTurns/lessonRate`（其中读【教训】的轮数，衡量预防性回忆有没有发生）。这三个数才用来判断机制好坏。
 
-**进度环**（这两个数字的可视化，在设置页顶部那行统计的左边）：一圈分两段——蓝色 = `anyRate`（最近窗口里有回忆的轮次占比），深灰 = 距上次压缩走了多少轮（`turns - compress.lastTurns` 除以 `compress.every`=100），浅灰是环底，圆心写蓝色那段的百分比。`compress.lastTurns` 由宿主在每次压缩开始时写进 `compress.json` 的 `turns` 字段；老状态文件没有这个字段时前端退回 `turns % every`，不会显示成空环。
+**进度环**（这两个数字的可视化，在设置页顶部那行统计的左边）：整圈就是一轮压缩周期（`compress.every` = 100 轮），两个量都以「轮」为单位直接叠在圈上——浅蓝 = 距上次压缩已经走了多少轮（`compress.sinceTurns`），深蓝 = 这些轮里真有记忆被回忆到的轮数（`compress.recallSince`，从 `recall.json` 里按 `turn > 上次压缩轮` 去重数出来），浅灰是还没走到的部分；深蓝压在浅蓝上面、同一起点，所以「深蓝有多长」就是这一周期里召回的实际产出占比，圆心写它的百分比。`compress.lastTurns` / `sinceTurns` / `recallSince` 由宿主在 `snapshot()` 里算好；老状态文件没有 `turns` 字段时退回 `turns % every` 估一个周期起点，不会显示成空环。
 
 **批准只改正文**：`proposed/` 里只有正文，`approveFile()` 沿用原文件的 YAML 头（所以 description 不会被改稿冲掉），刷新复核日，删掉方案。
 

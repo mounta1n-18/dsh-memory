@@ -124,15 +124,16 @@ window.__ModuleLoader__.load({
      * 两段从 12 点方向顺时针接续，剩下的浅灰是环底。
      */
     function RecallRing(props) {
-      const percent = Math.max(0, Math.min(100, Number(props && props.percent) || 0));
-      const fill = Math.max(0, Math.min(100, Number(props && props.fill) || 0));
+      const elapsed = Math.max(0, Math.min(100, Number(props && props.fill) || 0));
+      // 深蓝不能超出浅蓝：整圈都是「轮」，回忆轮必然落在已走过的轮里。
+      const percent = Math.max(0, Math.min(elapsed, Number(props && props.percent) || 0));
       const size = (props && props.size) || 46;
       const stroke = (props && props.stroke) || 5;
       const mid = size / 2;
       const r = (size - stroke) / 2;
       const c = 2 * Math.PI * r;
-      const blueLen = (c * percent) / 100;
-      const grayLen = Math.min(c - blueLen, (c * fill) / 100);
+      const fillLen = (c * elapsed) / 100;
+      const percentLen = (c * percent) / 100;
       const common = { fill: 'none', strokeWidth: stroke, strokeLinecap: 'butt' };
       return h(
         'svg',
@@ -144,25 +145,26 @@ window.__ModuleLoader__.load({
           'aria-label': (props && props.label) || '',
         },
         h('circle', { cx: mid, cy: mid, r, stroke: '#e6e6e8', ...common }),
-        blueLen > 0.01
+        // 浅蓝：距上次压缩已经走过的轮数（整圈 = 100 轮）
+        fillLen > 0.01
           ? h('circle', {
               cx: mid,
               cy: mid,
               r,
-              stroke: '#4c8bf5',
-              strokeDasharray: `${blueLen} ${c - blueLen}`,
+              stroke: '#a8c8f5',
+              strokeDasharray: `${fillLen} ${c - fillLen}`,
               transform: `rotate(-90 ${mid} ${mid})`,
               ...common,
             })
           : null,
-        grayLen > 0.01
+        // 深蓝：这些轮里真有回忆生效的轮数，压在浅蓝上面（同一起点）
+        percentLen > 0.01
           ? h('circle', {
               cx: mid,
               cy: mid,
               r,
-              stroke: '#6b7280',
-              strokeDasharray: `${grayLen} ${c - grayLen}`,
-              strokeDashoffset: -blueLen,
+              stroke: '#2f6fe4',
+              strokeDasharray: `${percentLen} ${c - percentLen}`,
               transform: `rotate(-90 ${mid} ${mid})`,
               ...common,
             })
@@ -182,19 +184,31 @@ window.__ModuleLoader__.load({
       );
     }
 
-    /** 环的数据：两个量纲不同的比例（回忆轮次 / 压缩倒计时），分段画一圈。 */
+    /**
+     * 环的数据：整圈 = COMPRESS_EVERY 轮（默认 100）。
+     * fill  = 距上次压缩已走的轮数 / 整圈；
+     * percent = 这些轮里真有回忆的轮数 / 整圈。
+     * 两个量的单位都是「轮」，所以能直接叠在同一圈上。
+     */
     function ringProps(data) {
       const every = Number(data && data.compress && data.compress.every) || 100;
       const turns = Number(data && data.turns) || 0;
-      const rawLast = data && data.compress ? data.compress.lastTurns : null;
-      const since = typeof rawLast === 'number' && Number.isFinite(rawLast) ? Math.max(0, turns - rawLast) : turns % every;
-      const percent = Number(data && data.recall && data.recall.anyRate) || 0;
+      const cmp = (data && data.compress) || {};
+      const rawLast = cmp.lastTurns;
+      const since =
+        typeof cmp.sinceTurns === 'number'
+          ? cmp.sinceTurns
+          : typeof rawLast === 'number' && Number.isFinite(rawLast)
+            ? Math.max(0, turns - rawLast)
+            : turns % every;
+      const recallSince = typeof cmp.recallSince === 'number' ? cmp.recallSince : Number(data && data.recall && data.recall.anyTurns) || 0;
       return {
-        percent,
-        fill: Math.min(100, (since / every) * 100),
+        percent: (recallSince / every) * 100,
+        fill: (since / every) * 100,
         since,
+        recallSince,
         every,
-        label: `距上次压缩 ${since}/${every} 轮；最近窗口里有回忆的轮次占 ${percent}%`,
+        label: `整圈 ${every} 轮：已走 ${since} 轮（浅蓝），其中 ${recallSince} 轮想到过记忆（深蓝）`,
       };
     }
 
@@ -2040,13 +2054,13 @@ window.__ModuleLoader__.load({
             )
           : null,
         // 单条「回忆率」永远偏低（一条记忆一次任务读一次就够），光看它会误以为机制坏了。
-        // 顶部给整体口径：窗口内多少轮真的想起过记忆、覆盖了几条、教训被读了几轮。
+        // 顶部那个环：整圈 = 一轮压缩周期（100 轮）；浅蓝 = 已经走了多少轮；深蓝 = 其中真有回忆的轮数。
         data && data.recall
           ? h(
               'div',
               {
                 title:
-                  '整圈一分为二：蓝色是最近窗口里「有回忆的轮次」占比，深灰是「距上次压缩」走了多少轮（满一圈就该压缩）；浅灰是环底。',
+                  '整圈 = 距下次压缩的 100 轮：浅蓝是已经走过的轮数，深蓝是其中真有回忆生效的轮数，浅灰是还没走到的部分。三者单位都是「轮」。',
                 style: {
                   fontSize: 12,
                   color: 'var(--dsw-alias-label-secondary)',
@@ -2061,7 +2075,8 @@ window.__ModuleLoader__.load({
               h(
                 'div',
                 { style: { display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'center', minWidth: 0 } },
-                h('span', null, `近 ${data.recall.window} 轮：${data.recall.anyTurns} 轮想到过记忆（${data.recall.anyRate}%）`),
+                h('span', null, `本轮周期已走 ${ringProps(data).since}/${ringProps(data).every} 轮`),
+                h('span', null, `其中 ${ringProps(data).recallSince} 轮想到过记忆`),
                 h('span', null, `覆盖 ${data.recall.covered}/${data.recall.total} 条`),
                 h(
                   'span',

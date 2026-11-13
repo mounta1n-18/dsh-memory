@@ -256,6 +256,16 @@ function lessonReminder() {
   return `【教训提醒】动手前扫一眼，命中就先 memory_read（可一次传多条）再动手：${line}`;
 }
 
+/** 从 fromTurn 之后有回忆的轮数：面板那个环的深蓝段（单位=轮）。 */
+function recallTurnsSince(fromTurn) {
+  const events = readJson(RECALL, []);
+  const turns = new Set();
+  for (const ev of Array.isArray(events) ? events : []) {
+    if (ev && typeof ev.turn === 'number' && ev.turn > fromTurn && ev.turn <= turnCount) turns.add(ev.turn);
+  }
+  return turns.size;
+}
+
 /** 首关键词就是分类；缺了或不在表里返回空串。 */
 function categoryOf(keywords) {
   const head = String(keywords || '').split('/')[0].trim();
@@ -1606,6 +1616,11 @@ function snapshot() {
   const unfinished = Boolean(cst?.startedAt) && !cst?.finishedAt;
   const running = unfinished && Number.isFinite(cstart) && Date.now() - cstart < COMPRESS_STALE_MS;
 
+  // 面板顶部那个环：整圈 = COMPRESS_EVERY 轮；浅蓝 = 距上次压缩已走的轮数，深蓝 = 其中真有回忆的轮数。
+  const lastTurns = Number.isFinite(cst?.turns) ? cst.turns : null;
+  const cycleStart = lastTurns === null ? turnCount - (turnCount % COMPRESS_EVERY) : lastTurns;
+  const sinceTurns = Math.max(0, turnCount - cycleStart);
+
   return {
     state,
     count,
@@ -1627,7 +1642,9 @@ function snapshot() {
       startedAt: cst?.startedAt || '',
       finishedAt: cst?.finishedAt || '',
       // 上次压缩发生在第几轮：面板拿它和 turns 算「距上次压缩走了多少轮」。
-      lastTurns: Number.isFinite(cst?.turns) ? cst.turns : null,
+      lastTurns,
+      sinceTurns,
+      recallSince: recallTurnsSince(cycleStart),
       stage: cst?.stage || '',
       reason: cst?.reason || '',
       files: Array.isArray(cst?.files) ? cst.files : [],
