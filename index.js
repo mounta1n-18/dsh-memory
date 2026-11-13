@@ -1054,7 +1054,7 @@ async function runCompress(reason) {
   if (compressRunning) return { skipped: true, running: true };
   compressRunning = true;
   const startedAt = new Date().toISOString();
-  writeJson(COMPRESS, { startedAt, stage: 'plan', reason, files: [], detail: '' });
+  writeJson(COMPRESS, { startedAt, turns: turnCount, stage: 'plan', reason, files: [], detail: '' });
   try {
     const plan = compressPlan();
     const pending = new Set(proposedFiles());
@@ -1074,6 +1074,7 @@ async function runCompress(reason) {
     if (!light.length && !heavy.length) {
       writeJson(COMPRESS, {
         startedAt,
+        turns: turnCount,
         finishedAt: new Date().toISOString(),
         stage: 'done',
         reason,
@@ -1084,7 +1085,7 @@ async function runCompress(reason) {
     }
     const key = apiKey();
     if (!key) throw new Error('缺少 DSH_AUTOMATION_API_KEY，请在 ~/.dsh/automation.env 里配置');
-    writeJson(COMPRESS, { startedAt, stage: 'request', reason, files: [], detail: `轻调整 ${light.length} 份、中删减 ${heavy.length} 份` });
+    writeJson(COMPRESS, { startedAt, turns: turnCount, stage: 'request', reason, files: [], detail: `轻调整 ${light.length} 份、中删减 ${heavy.length} 份` });
 
     const items = [];
     const failures = [];
@@ -1140,6 +1141,7 @@ async function runCompress(reason) {
     const allFailed = !items.length && failures.length > 0;
     writeJson(COMPRESS, {
       startedAt,
+      turns: turnCount,
       finishedAt: new Date().toISOString(),
       stage: allFailed ? 'failed' : 'done',
       reason,
@@ -1158,6 +1160,7 @@ async function runCompress(reason) {
   } catch (err) {
     writeJson(COMPRESS, {
       startedAt,
+      turns: turnCount,
       finishedAt: new Date().toISOString(),
       stage: 'failed',
       reason,
@@ -1563,6 +1566,8 @@ function snapshot() {
       failed: cst?.stage === 'failed',
       startedAt: cst?.startedAt || '',
       finishedAt: cst?.finishedAt || '',
+      // 上次压缩发生在第几轮：面板拿它和 turns 算「距上次压缩走了多少轮」。
+      lastTurns: Number.isFinite(cst?.turns) ? cst.turns : null,
       stage: cst?.stage || '',
       reason: cst?.reason || '',
       files: Array.isArray(cst?.files) ? cst.files : [],

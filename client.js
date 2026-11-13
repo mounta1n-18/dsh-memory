@@ -94,25 +94,6 @@ window.__ModuleLoader__.load({
       h('path', { d: 'M6 9l6 6 6-6' }),
     );
 
-    const HOURGLASS_ICON = h(
-      'svg',
-      {
-        width: 13,
-        height: 13,
-        viewBox: '0 0 24 24',
-        fill: 'none',
-        stroke: 'currentColor',
-        strokeWidth: 2,
-        strokeLinecap: 'round',
-        strokeLinejoin: 'round',
-        'aria-hidden': 'true',
-      },
-      h('path', { d: 'M7 3h10' }),
-      h('path', { d: 'M7 21h10' }),
-      h('path', { d: 'M8 3c0 4 8 5 8 9s-8 5-8 9' }),
-      h('path', { d: 'M16 3c0 4-8 5-8 9s8 5 8 9' }),
-    );
-
     // 大脑图标：菜单行要的是「组件」，行内提示要的是「元素」，两种都给。
     function BrainGlyph(props) {
       const size = props && props.size ? props.size : 14;
@@ -135,6 +116,87 @@ window.__ModuleLoader__.load({
       );
     }
     const BRAIN_ICON = h(BrainGlyph, null);
+
+    /**
+     * 进度环（右下角的那个小圆）：一圈分两段——
+     *   蓝色 = 最近窗口里「有回忆的轮次」占比（data.recall.anyRate）
+     *   深灰 = 距上次压缩已经走了多少轮（turns - compress.lastTurns，满 every 就该压了）
+     * 两段从 12 点方向顺时针接续，剩下的浅灰是环底。
+     */
+    function RecallRing(props) {
+      const percent = Math.max(0, Math.min(100, Number(props && props.percent) || 0));
+      const fill = Math.max(0, Math.min(100, Number(props && props.fill) || 0));
+      const size = (props && props.size) || 46;
+      const stroke = (props && props.stroke) || 5;
+      const mid = size / 2;
+      const r = (size - stroke) / 2;
+      const c = 2 * Math.PI * r;
+      const blueLen = (c * percent) / 100;
+      const grayLen = Math.min(c - blueLen, (c * fill) / 100);
+      const common = { fill: 'none', strokeWidth: stroke, strokeLinecap: 'butt' };
+      return h(
+        'svg',
+        {
+          width: size,
+          height: size,
+          viewBox: `0 0 ${size} ${size}`,
+          role: 'img',
+          'aria-label': (props && props.label) || '',
+        },
+        h('circle', { cx: mid, cy: mid, r, stroke: '#e6e6e8', ...common }),
+        blueLen > 0.01
+          ? h('circle', {
+              cx: mid,
+              cy: mid,
+              r,
+              stroke: '#4c8bf5',
+              strokeDasharray: `${blueLen} ${c - blueLen}`,
+              transform: `rotate(-90 ${mid} ${mid})`,
+              ...common,
+            })
+          : null,
+        grayLen > 0.01
+          ? h('circle', {
+              cx: mid,
+              cy: mid,
+              r,
+              stroke: '#6b7280',
+              strokeDasharray: `${grayLen} ${c - grayLen}`,
+              strokeDashoffset: -blueLen,
+              transform: `rotate(-90 ${mid} ${mid})`,
+              ...common,
+            })
+          : null,
+        h(
+          'text',
+          {
+            x: mid,
+            y: mid,
+            textAnchor: 'middle',
+            dominantBaseline: 'central',
+            fontSize: Math.round(size * 0.24),
+            fill: 'currentColor',
+          },
+          `${Math.round(percent)}%`,
+        ),
+      );
+    }
+
+    /** 环的数据：两个量纲不同的比例（回忆轮次 / 压缩倒计时），分段画一圈。 */
+    function ringProps(data) {
+      const every = Number(data && data.compress && data.compress.every) || 100;
+      const turns = Number(data && data.turns) || 0;
+      const rawLast = data && data.compress ? data.compress.lastTurns : null;
+      const since = typeof rawLast === 'number' && Number.isFinite(rawLast) ? Math.max(0, turns - rawLast) : turns % every;
+      const percent = Number(data && data.recall && data.recall.anyRate) || 0;
+      return {
+        percent,
+        fill: Math.min(100, (since / every) * 100),
+        since,
+        every,
+        label: `距上次压缩 ${since}/${every} 轮；最近窗口里有回忆的轮次占 ${percent}%`,
+      };
+    }
 
     const LOCK_ICON = h(
       'svg',
@@ -1384,8 +1446,8 @@ window.__ModuleLoader__.load({
         }
       };
 
-      // 沙漏：立刻跑一次压缩判定，跑到宿主那边收工为止（轮询状态）。
-      // 运行中的提示只留在沙漏按钮上（显示「压缩中」），不再另外刷一行，避免重复。
+      // 「仿生压缩」按钮：立刻跑一次压缩判定，跑到宿主那边收工为止（轮询状态）。
+      // 运行中的提示只留在按钮上（显示「压缩中」），不再另外刷一行，避免重复。
       const compressNow = async () => {
         if (compressing) return;
         setCompressing(true);
@@ -1798,12 +1860,12 @@ window.__ModuleLoader__.load({
             'button',
             {
               type: 'button',
-              title: data?.compress?.interrupted ? '上次压缩中断过，点一下补跑' : '立刻跑一次压缩判定',
+              title: data?.compress?.interrupted ? '上次压缩中断过，点一下补跑' : '立刻跑一次压缩判定（仿生压缩）',
               style: {
                 ...BUTTON,
                 display: 'inline-flex',
                 alignItems: 'center',
-                gap: 4,
+                gap: 5,
                 ...(data?.compress?.interrupted
                   ? {
                       borderColor: 'var(--dsw-alias-state-warn-primary)',
@@ -1814,8 +1876,8 @@ window.__ModuleLoader__.load({
               disabled: compressing || Boolean(data?.compress?.running),
               onClick: compressNow,
             },
-            HOURGLASS_ICON,
-            compressing || data?.compress?.running ? '压缩中' : '',
+            h(BrainGlyph, { size: 13 }),
+            compressing || data?.compress?.running ? '压缩中' : '仿生压缩',
           ),
           h('span', { style: { marginLeft: 'auto', fontSize: 12, color: 'var(--dsw-alias-label-secondary)' } }, banner),
         ),
@@ -1863,7 +1925,7 @@ window.__ModuleLoader__.load({
                   fontSize: 12,
                 },
               },
-              `上次压缩中断（${String(data.compress.startedAt).slice(0, 16).replace('T', ' ')} 起，${data.compress.stage || '未知阶段'}）——点沙漏补跑。`,
+              `上次压缩中断（${String(data.compress.startedAt).slice(0, 16).replace('T', ' ')} 起，${data.compress.stage || '未知阶段'}）——点「仿生压缩」补跑。`,
             )
           : null,
         data?.compress?.failed && !data?.compress?.running
@@ -1878,7 +1940,7 @@ window.__ModuleLoader__.load({
                   fontSize: 12,
                 },
               },
-              `上次压缩失败（${String(data.compress.finishedAt || '').slice(5, 16).replace('T', ' ')}）：${data.compress.detail || '未知原因'}——点沙漏重跑。`,
+              `上次压缩失败（${String(data.compress.finishedAt || '').slice(5, 16).replace('T', ' ')}）：${data.compress.detail || '未知原因'}——点「仿生压缩」重跑。`,
             )
           : null,
         creating
@@ -1958,24 +2020,30 @@ window.__ModuleLoader__.load({
               'div',
               {
                 title:
-                  '整体召回率：按「轮」算，而不是按单条记忆算。一条记忆在被需要的那一轮读一次就够了，所以单条百分比天然很低。',
+                  '整圈一分为二：蓝色是最近窗口里「有回忆的轮次」占比，深灰是「距上次压缩」走了多少轮（满一圈就该压缩）；浅灰是环底。',
                 style: {
                   fontSize: 12,
                   color: 'var(--dsw-alias-label-secondary)',
                   padding: '2px 2px',
                   display: 'flex',
-                  gap: 14,
+                  alignItems: 'center',
+                  gap: 12,
                   flexWrap: 'wrap',
                 },
               },
-              h('span', null, `近 ${data.recall.window} 轮：${data.recall.anyTurns} 轮想到过记忆（${data.recall.anyRate}%）`),
-              h('span', null, `覆盖 ${data.recall.covered}/${data.recall.total} 条`),
+              h(RecallRing, ringProps(data)),
               h(
-                'span',
-                null,
-                data.recall.lessonRate === null
-                  ? '教训 —'
-                  : `教训 ${data.recall.lessonTurns} 轮（${data.recall.lessonRate}%）`,
+                'div',
+                { style: { display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'center', minWidth: 0 } },
+                h('span', null, `近 ${data.recall.window} 轮：${data.recall.anyTurns} 轮想到过记忆（${data.recall.anyRate}%）`),
+                h('span', null, `覆盖 ${data.recall.covered}/${data.recall.total} 条`),
+                h(
+                  'span',
+                  null,
+                  data.recall.lessonRate === null
+                    ? '教训 —'
+                    : `教训 ${data.recall.lessonTurns} 轮（${data.recall.lessonRate}%）`,
+                ),
               ),
             )
           : null,
