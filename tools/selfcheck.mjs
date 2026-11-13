@@ -370,8 +370,9 @@ eq('失败原因透传', r.body.detail, '模型超时');
 console.log('\n[5] 首关键词硬约束');
 const write = state.tools.get('memory_write');
 ok(
-  '关键词提示要求写成场景钩子（标题党口径）',
+  '关键词提示要求写成短钩子（不是句子）',
   /什么场景下必须点开这条/.test(write.description) &&
+    /每段 ≤10 字/.test(write.description) &&
     /像标题党一样/.test(write.description) &&
     /空泛词/.test(write.description),
   write.description.slice(0, 80),
@@ -381,8 +382,9 @@ ok(
   /别写错误码和根因/.test(write.description) && /教训\/422|422、报错/.test(write.description),
 );
 ok(
-  'keywords 参数描述也是短句钩子口径',
-  /像标题党一样勾人但要具体/.test(write.parameters.properties.keywords.description),
+  'keywords 参数描述也是短钩子口径',
+  /钩子不是句子/.test(write.parameters.properties.keywords.description) &&
+    /每段 ≤10 字/.test(write.parameters.properties.keywords.description),
   write.parameters.properties.keywords.description,
 );
 ok('教训正文要求写场景/链条/修复三段', /错误链条/.test(write.description) && /绕开与修复/.test(write.description));
@@ -437,6 +439,25 @@ const actOk = write.execute({
   body: '自检正文',
 });
 ok('动作短语放行', /已记下/.test(actOk.text), actOk.text.slice(0, 60));
+
+// 关键词是钩子不是句子（2026-11-13 用户口径）：段太长、段太多都要拒，并把该砍哪段说清楚。
+threw = '';
+try {
+  write.execute({ name: 'tmp-long', keywords: '教训/批量删除家目录前一定要先看清路径', description: '自检', body: '自检正文' });
+} catch (err) {
+  threw = err.message;
+}
+ok('关键词写成长句被拒', /写成句子了/.test(threw) && /10 字/.test(threw), threw);
+threw = '';
+try {
+  write.execute({ name: 'tmp-seg', keywords: '教训/删目录/清缓存/装插件/改配置/卸插件', description: '自检', body: '自检正文' });
+} catch (err) {
+  threw = err.message;
+}
+ok('关键词段数超 4 被拒', /最多 4 段/.test(threw), threw);
+r = await call(state, '/dsh-memory/keyword', { file: 'pl-mcd.md', keywords: '说明书/点麦当劳前先看看有没有券' });
+eq('设置页改关键词同样拦长句', r.code, 400);
+ok('拦住时给出改写提示', /写成句子了/.test(r.body?.error || ''), r.body?.error);
 
 // 正文长度：2000 字以内静默，超过只提一句（用户口径 2026-10-28：别用「警告」把人吓短）
 const shortBody = write.execute({ name: 'len-short', keywords: '其它/长度自检', description: '自检', body: '甲'.repeat(600) });

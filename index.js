@@ -241,6 +241,28 @@ function assertCategory(keywords, { allowManual = false } = {}) {
 }
 
 /**
+ * 关键词是「钩子」，不是「关键句」（2026-11-13 用户口径）：
+ * 太长就从提醒变成负担，每段 ≤10 字、最多 4 段，写成词组，不能写成「……前看」这类句子。
+ */
+const KEYWORD_SEG_MAX = 10;
+const KEYWORD_SEG_COUNT = 4;
+
+function keywordTooLong(keywords) {
+  const parts = String(keywords || '')
+    .split('/')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const longSeg = parts.filter((p) => Array.from(p).length > KEYWORD_SEG_MAX);
+  if (longSeg.length) {
+    return `关键词写成句子了（每段最多 ${KEYWORD_SEG_MAX} 字），超长的有：${longSeg.map((p) => `「${p}」${Array.from(p).length} 字`).join('、')}。砍成名词/动词词组重试，例如：删家目录 / 装完即验收 / MCP·懒加载。`;
+  }
+  if (parts.length > KEYWORD_SEG_COUNT) {
+    return `关键词最多 ${KEYWORD_SEG_COUNT} 段（含分类），现在是 ${parts.length} 段：${parts.join('/')}。留最能勾人的那几段。`;
+  }
+  return null;
+}
+
+/**
  * 教训关键词的「预防性」校验（2026-11-09 用户口径）：
  * 关键词的作用是让未来的模型看见它、意识到自己下一步可能闯祸，从而先展开回忆。
  * 所以它必须写「犯错之前的任务与动作」，写成事后症状/错误码/根因就等于没写——
@@ -716,11 +738,11 @@ let compressRunning = false;
 const WRITE_TOOL_DESCRIPTION = [
   '记住一件以后还会用到的事。任务收尾时过一遍：有没有新的稳定事实、可复用的做法、或一次纠正？有就写一条，最多一条。',
   '首词是分类：资料 / 教训 / 说明书 / 其它（项目记忆 只由用户点「大脑」按钮生成）。',
-  'keywords 是钩子，不是摘要：写「什么场景下必须点开这条」，要具体、要勾人——像标题党一样，让人在需要时非点不可。空泛词（插件、记忆、工具、说明、回忆）等于没写。',
-  '· 教训：写「会在哪个任务、哪一步闯祸」——批量删家目录前先看 · 往会话里塞消息前先看 · 装完插件就验收前先看。',
-  '· 资料：写认得出来的场景——写邮件前看称呼 · 中文乱码先看编码环境。',
-  '· 说明书：写「卡住时你正想干什么」——记忆插件怎么用 · 读写记忆必读 · MCP 连不上先看懒加载。',
-  '· 1~5 段，用 / 分隔；教训里别写错误码和根因（422、报错、根因是缺 role），你正要犯错时想不到它们。',
+  'keywords 是钩子，不是句子：写「什么场景下必须点开这条」，但要短——每段 ≤10 字、1~4 段用 / 分隔。像标题党一样勾人，别写成「……前看」「……怎么用」这种尾巴。空泛词（插件、记忆、工具、说明、回忆）等于没写。',
+  '· 教训：`教训/删家目录/重装DSH` · `教训/装完即验收` · `教训/会话注入/自拼消息`。',
+  '· 资料：`资料/中文乱码/代码页` · `资料/称呼/基本信息`。',
+  '· 说明书：`说明书/MCP/懒加载` · `说明书/记忆读写/索引`。',
+  '教训里别写错误码和根因（422、报错、根因是缺 role），你正要犯错时想不到它们。',
   '写「教训」时 body 必须三段，缺一段就没有预防作用：① 场景（什么任务、什么动作会踩到，读者一看就知道「我现在正在这个场景里」）；② 错误链条（第一步做什么、哪步开始不对、为什么没察觉）；③ 绕开与修复（下次怎么走、已部署什么防护）。',
 ].join(' ');
 
@@ -731,7 +753,7 @@ const WRITE_TOOL_PARAMETERS = {
     keywords: {
       type: 'string',
       description:
-        '写「什么场景下必须点开这条」，像标题党一样勾人但要具体。教训=哪个任务哪一步会闯祸（批量删家目录前先看），资料=认得出来的场景（写邮件前看称呼），说明书=卡住时你正想干什么（读写记忆必读）。空泛词（插件/记忆/工具）等于没写；1~5 段用 / 分隔，首段是分类。',
+        '钩子不是句子：每段 ≤10 字，1~4 段用 / 分隔，首段是分类。教训写场景（`教训/删家目录`、`教训/装完即验收`），资料写认得出来的对象（`资料/称呼/基本信息`），说明书写工具名（`说明书/MCP/懒加载`）。别写「……前看」尾巴，别写空泛词（插件/记忆/工具）。',
     },
     description: { type: 'string', description: '一句话说清这是什么、什么时候该读。' },
     body: { type: 'string', description: '正文，Markdown，写完整句子；2000 字以内通常够用，内容确实需要可以更长。' },
@@ -1598,11 +1620,10 @@ function readBody(req, limit = 65536) {
 function setKeywords(file, keywords) {
   const entry = readEntries().find((e) => e.file === file);
   if (entry?.protected) throw new Error('这份记忆已锁定，不能修改关键词');
-  return updateCell(file, 2, `${String(keywords)
-    .replace(/[|\r\n]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 80)}`);
+  const clean = normalizeKeywords(String(keywords).replace(/[|\r\n]/g, ' ').replace(/\s+/g, ' ').trim());
+  const lengthProblem = keywordTooLong(clean);
+  if (lengthProblem) throw new Error(lengthProblem);
+  return updateCell(file, 2, clean.slice(0, 80));
 }
 
 /** 改「启用」单元格：开=是，关=否。只控制是否披露，不算改原文或关键词。 */
@@ -1777,6 +1798,8 @@ export function apply(ctx) {
             if (!keywords) throw new Error('keywords 不能为空，否则大纲里点不到它');
             // 「项目记忆」只由 /remember 或设置页新建产生，模型通道一律拒绝。
             assertCategory(keywords);
+            const lengthProblem = keywordTooLong(keywords);
+            if (lengthProblem) throw new Error(lengthProblem);
             const kwProblem = lessonKeywordProblem(keywords);
             if (kwProblem) throw new Error(kwProblem);
             if (!description) throw new Error('description 不能为空，一句话说清什么时候读');
@@ -1853,6 +1876,8 @@ export function apply(ctx) {
             const nextKeywords = args?.keywords ? oneLine(args.keywords, 80) : '';
             if (nextKeywords) {
               assertCategory(nextKeywords); // 换关键词也要守住分类
+              const lengthProblem = keywordTooLong(nextKeywords);
+              if (lengthProblem) throw new Error(lengthProblem);
               const kwProblem = lessonKeywordProblem(nextKeywords);
               if (kwProblem) throw new Error(kwProblem);
             }
