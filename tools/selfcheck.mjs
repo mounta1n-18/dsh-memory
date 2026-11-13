@@ -15,9 +15,11 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const HERE = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+// 路径里可能有空格（如 `C:\DSH Plugin\...`）：必须走 fileURLToPath，
+// 直接取 URL.pathname 会留下 %20，再套 pathToFileURL 就变成 %2520。
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PKG = path.resolve(HERE, '..');
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-selfcheck-'));
 const MEM = path.join(HOME, 'memory');
@@ -278,11 +280,30 @@ ok(
 );
 ok('裁剪后长度不超过上限+省略号', Array.from(plMem.slice('pl-mem='.length)).length <= 43, `${Array.from(plMem.slice('pl-mem='.length)).length} 字`);
 
-// 有「教训/」条目时，大纲必须自带「什么时候必须先读」+ 末尾前置检查：
-// 召回率不靠模型自觉，靠索引里写清动作触发条件。
-ok('大纲开头给动词触发清单', /什么时候必须先读/.test(outline) && /动手改文件/.test(outline));
+// 有「教训/」条目时，大纲必须自带「什么场景该点开」+ 末尾前置检查：
+// 召回率不靠模型自觉，靠索引里写清场景钩子。
+ok('大纲开头写清关键词是场景钩子', /什么场景下必须点开/.test(outline) && /动手改 \/ 删 \/ 装 \/ 跑命令之前/.test(outline));
 ok('大纲提示可一次读多条', /可一次传多个/.test(outline));
-ok('大纲带教训前置检查', /就先 memory_read 读完再动手/.test(outline), outline.slice(-120));
+ok('大纲带教训前置检查', /命中就先 memory_read 读完，再动手/.test(outline), outline.slice(-120));
+
+// 索引表允许手改：有人会写 `;`、`·`、`,` 当分隔符，混进表里会让分类解析错位。
+{
+  const indexPath = path.join(MEM, 'MEMORY.md');
+  const before = fs.readFileSync(indexPath, 'utf8');
+  const dirty = '| `dirty-sep.md` | 说明书/记忆插件;关键说明 · 读写记忆必读 | 是 | reference | 手写的脏分隔符。 | 2026-11-13 | 否 |';
+  fs.writeFileSync(indexPath, `${before}${dirty}\n`, 'utf8');
+  fs.writeFileSync(
+    path.join(MEM, 'dirty-sep.md'),
+    '---\nname: dirty-sep\ndescription: 脏分隔符自检。\ntype: reference\n---\n\n自检正文。\n',
+    'utf8',
+  );
+  const snap = await call(state, '/dsh-memory/status');
+  const row = (snap.body.entries || []).find((e) => e.file === 'dirty-sep.md');
+  eq('脏分隔符（; · ,）读成 /', row?.keywords, '说明书/记忆插件/关键说明/读写记忆必读');
+  ok('归一后大纲里也是 / 分隔', /dirty-sep=记忆插件\/关键说明\/读写记忆必读/.test(snap.body.outline));
+  fs.writeFileSync(indexPath, before, 'utf8');
+  fs.rmSync(path.join(MEM, 'dirty-sep.md'), { force: true });
+}
 
 console.log('\n[3] 闸门按路径身份');
 const body = path.join(MEM, 'pl-perm.md');
@@ -349,13 +370,20 @@ eq('失败原因透传', r.body.detail, '模型超时');
 console.log('\n[5] 首关键词硬约束');
 const write = state.tools.get('memory_write');
 ok(
-  '教训关键词要求写犯错前的动作',
-  /犯这个错\*\*之前\*\*/.test(write.description) && /让读者一眼认出/.test(write.description),
+  '关键词提示要求写成场景钩子（标题党口径）',
+  /什么场景下必须点开这条/.test(write.description) &&
+    /像标题党一样/.test(write.description) &&
+    /空泛词/.test(write.description),
   write.description.slice(0, 80),
 );
 ok(
   '教训关键词明确禁止事后症状/错误码',
-  /不要写事后症状、错误码或根因/.test(write.description) && /教训\/422/.test(write.description),
+  /别写错误码和根因/.test(write.description) && /教训\/422|422、报错/.test(write.description),
+);
+ok(
+  'keywords 参数描述也是短句钩子口径',
+  /像标题党一样勾人但要具体/.test(write.parameters.properties.keywords.description),
+  write.parameters.properties.keywords.description,
 );
 ok('教训正文要求写场景/链条/修复三段', /错误链条/.test(write.description) && /绕开与修复/.test(write.description));
 const mk = (keywords) => ({ name: 'tmp-check', keywords, description: '自检用', body: '自检正文' });
