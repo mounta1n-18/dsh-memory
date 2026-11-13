@@ -1402,7 +1402,18 @@ window.__ModuleLoader__.load({
         }
       };
 
-      const open = async (file) => {
+      // 否决「待删除」判定：只把复核日刷到今天，正文一个字都不动。
+  const keep = async (entry) => {
+    try {
+      await post('/dsh-memory/keep', { file: entry.file });
+      setBanner(`已保留 ${entry.file}：复核日刷新到今天，两周内不会再判待删除`);
+      setTimeout(() => setBanner(''), 2600);
+    } catch (err) {
+      flash(entry.file, err.message);
+    }
+  };
+
+  const open = async (file) => {
         try {
           await post('/dsh-memory/open', { file });
         } catch (err) {
@@ -1668,6 +1679,21 @@ window.__ModuleLoader__.load({
                     reviewing === entry.file ? '收起' : '审核',
                   )
                 : null,
+            entry.pendingDelete
+              ? h(
+                  'button',
+                  {
+                    type: 'button',
+                    title: '不删：把复核日刷新到今天，正文不动',
+                    style: BUTTON,
+                    onClick: (ev) => {
+                      stop(ev);
+                      keep(entry);
+                    },
+                  },
+                  '保留',
+                )
+              : null,
             h('button', { type: 'button', style: BUTTON, onClick: (ev) => { stop(ev); protect(entry); } }, entry.protected ? '已锁定' : '锁定'),
             h('button', { type: 'button', style: BUTTON, onClick: (ev) => { stop(ev); setExpanded(expanded === entry.file ? null : entry.file); } }, '参数'),
             h('button', { type: 'button', style: BUTTON, onClick: (ev) => { stop(ev); open(entry.file); } }, '打开位置'),

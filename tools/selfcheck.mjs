@@ -217,6 +217,16 @@ async function gate(state, name, args) {
   return 'pass';
 }
 
+/** 跑一遍 post-execute 链：返回最终 decision（可能被追加了 content）。 */
+async function afterTool(state, name, args, result = { content: [] }) {
+  let decision = { kind: 'accept', content: result.content || [] };
+  for (const handler of state.post) {
+    const prev = decision;
+    decision = await handler({ name, arguments: args }, result, async () => prev);
+  }
+  return decision;
+}
+
 /** 打一次路由：body 是对象就 POST JSON。 */
 async function call(state, routePath, body) {
   const handler = state.routes.get(routePath.split('?')[0]);
@@ -258,7 +268,7 @@ console.log(`\n[1] 装载面  DSH_HOME=${HOME}`);
 eq('两段系统提示注入', state.sections.length, 2);
 ok('注入顺序 outline < tidy-status', state.sections[0].name === 'memory:outline' && state.sections[1].name === 'memory:tidy-status');
 eq('四个模型工具', [...state.tools.keys()].sort().join(','), 'memory_delete,memory_read,memory_update,memory_write');
-eq('十五条路由（含 /remember、调用流水/详情与探针）', state.routes.size, 15);
+eq('十六条路由（含 /remember、保留、调用流水/详情与探针）', state.routes.size, 16);
 
 console.log('\n[2] 大纲不丢条目');
 const outline = state.sections[0].text();
@@ -991,6 +1001,37 @@ eq('全都失败时报 400', r.code, 400);
 ok('错误指向「没有调用 memory_write 工具」', /没有调用 memory_write/.test(r.body.error), r.body.error);
 state.llm = undefined;state.llm = undefined;state.llm = undefined;
 globalThis.fetch = realFetch;
+
+console.log('\n[15] 保留（否决待删除）与动手前提醒');
+{
+  const s = await call(state, '/dsh-memory/status');
+  const stale = s.body.entries.find((e) => e.pendingDelete);
+  ok('夹具里有「待删除」条目（否则这条测不到）', Boolean(stale), s.body.entries.map((e) => `${e.file}:${e.pendingDelete}`).join(','));
+  if (stale) {
+    eq('待删除条目的回忆率是 0', stale.recallRate, 0);
+    const kept = await call(state, '/dsh-memory/keep', { file: stale.file });
+    eq('保留接口 200', kept.code, 200);
+    eq('回包带 kept', kept.body.kept, stale.file);
+    const after = kept.body.entries.find((e) => e.file === stale.file);
+    ok('保留后不再待删除', !after.pendingDelete, `${after.file} pendingDelete=${after.pendingDelete}`);
+    eq('复核日刷成今天', after.reviewed, new Date().toLocaleDateString('sv-SE'));
+    ok('保留没动正文（YAML 头还在）', /^---\r?\n/.test(fs.readFileSync(path.join(MEM, stale.file), 'utf8')));
+    const bad = await call(state, '/dsh-memory/keep', { file: '../evil.md' });
+    eq('保留：非法文件名 400', bad.code, 400);
+  }
+  // 动手前提醒：写文件那一刻把【教训】钩子递一次，同一轮不重复，读过教训就不打扰。
+  userTurn();
+  const first = await afterTool(state, 'write', { file_path: path.join(MEM, 'pl-mcd.md') });
+  const firstText = (first.content || []).map((b) => String(b.text || '')).join('');
+  ok('写文件后被追加【教训提醒】', firstText.includes('【教训提醒】'), firstText.slice(0, 60));
+  ok('提醒里带「名称=关键词」', /noahs-ark=/.test(firstText), firstText.slice(0, 120));
+  const again = await afterTool(state, 'write', { file_path: path.join(MEM, 'pl-mcd.md') });
+  ok('同一轮只提醒一次', !(again.content || []).some((b) => String(b.text || '').includes('【教训提醒】')));
+  userTurn();
+  state.tools.get('memory_read').execute({ file: 'noahs-ark' });
+  const afterRead = await afterTool(state, 'write', { file_path: path.join(MEM, 'pl-mcd.md') });
+  ok('本轮已读教训就不再提醒', !(afterRead.content || []).some((b) => String(b.text || '').includes('【教训提醒】')));
+}
 
 console.log(`\n结果：${pass} 通过，${fails.length} 失败`);
 if (fails.length) {

@@ -68,6 +68,7 @@ const APPROVE_FILE_ROUTE = '/dsh-memory/approve-file';
 const REJECT_FILE_ROUTE = '/dsh-memory/reject-file';
 const TOGGLE_ROUTE = '/dsh-memory/toggle';
 const PROTECT_ROUTE = '/dsh-memory/protect';
+const KEEP_ROUTE = '/dsh-memory/keep';
 const CREATE_ROUTE = '/dsh-memory/create';
 const DELETE_ROUTE = '/dsh-memory/delete';
 const SEARCH_ROUTE = '/dsh-memory/search';
@@ -130,6 +131,8 @@ function resolveAgents(ctx) {
 
 /** 全局用户轮计数：只数用户会话的轮，子代理的轮不算。 */
 let turnCount = 0;
+/** 「动手前提醒」上次出现在哪一轮：同一轮只提醒一次。 */
+let lastRemindTurn = -1;
 
 function loadTurnCount() {
   const saved = readJson(TURNS, null);
@@ -215,6 +218,42 @@ function recallOverview() {
     covered: files.size,
     total: live.length,
   };
+}
+
+/**
+ * 「动手前提醒」：把【教训】钩子压成一行，在模型真要写文件 / 跑命令 / 装删的那一刻递到眼前。
+ * 索引常驻归常驻，模型动手时经常不回头看；这条提醒是「场景触发」而不是「等待自觉」。
+ * 每轮最多一次，且该轮已经读过教训就不再打扰。
+ */
+const REMIND_TOOLS = new Set(['write', 'edit', 'pwsh', 'computer_use', 'memory_delete']);
+
+function lessonEntries() {
+  try {
+    return readEntries().filter((e) => e.enabled && /^教训\//.test(e.keywords || ''));
+  } catch {
+    return [];
+  }
+}
+
+function lessonHooksLine(max = 8) {
+  const parts = lessonEntries()
+    .slice(0, max)
+    .map((e) => `${e.file.replace(/\.md$/i, '')}=${String(e.keywords || '').split('/').slice(1).join('/') || '（无关键词）'}`);
+  return parts.join(' · ');
+}
+
+function lessonReadThisTurn() {
+  const turn = turnCount || 1;
+  const files = new Set(lessonEntries().map((e) => e.file));
+  if (!files.size) return false;
+  const events = readJson(RECALL, []);
+  return (Array.isArray(events) ? events : []).some((ev) => ev && ev.turn === turn && files.has(ev.file));
+}
+
+function lessonReminder() {
+  const line = lessonHooksLine();
+  if (!line) return '';
+  return `【教训提醒】动手前扫一眼，命中就先 memory_read（可一次传多条）再动手：${line}`;
 }
 
 /** 首关键词就是分类；缺了或不在表里返回空串。 */
@@ -552,6 +591,27 @@ function approveFile(file) {
   fs.writeFileSync(target, joinDoc(attrs, incoming.body), 'utf8');
   updateCell(file, 6, today());
   fs.unlinkSync(src);
+  return file;
+}
+
+/**
+ * 保留：用户否决「待删除」判定。只把复核日刷到今天（索引第 6 列 + 正文 reviewed），
+ * 不同 STALE_DAYS 一起走就立刻又变回待删除，所以两边必须同时改。
+ */
+function keepEntry(file) {
+  if (!/^[\w.-]+\.md$/.test(file) || file === 'MEMORY.md') throw new Error('文件名非法');
+  const entry = readEntries().find((e) => e.file === file);
+  if (!entry) throw new Error('索引里没有这条记忆');
+  const target = path.join(MEM, file);
+  if (fs.existsSync(target)) {
+    const doc = splitDoc(fs.readFileSync(target, 'utf8'));
+    if (doc.attrs.length) {
+      const attrs = [...doc.attrs];
+      setAttr(attrs, 'reviewed', today());
+      fs.writeFileSync(target, joinDoc(attrs, doc.body), 'utf8');
+    }
+  }
+  updateCell(file, 6, today());
   return file;
 }
 
@@ -1995,14 +2055,26 @@ export function apply(ctx) {
         if (/^memory_(read|write|update|delete)$/.test(exec?.name || '') && decision && decision.kind === 'accept') {
           recordMemoryCall(exec);
         }
-        if (exec.name !== 'write' && exec.name !== 'edit') return decision;
-        if (!decision || decision.kind !== 'accept' || decision.value !== undefined) return decision;
-        const abs = memoryTargetOf(exec);
-        if (!abs) return decision;
-        const { body, length } = bodyLength(fs.readFileSync(abs, 'utf8'));
-        if (length <= MEM_LIMIT) return decision;
-        const block = { type: 'text', text: oversizeWarning(path.basename(abs), length) };
-        return { ...decision, content: [...(decision.content || result.content || []), block] };
+        if (!decision || decision.kind !== 'accept') return decision;
+        const extra = [];
+        // 动手前提醒：写 / 跑 / 装删之前把【教训】钩子递一次（每轮最多一条，已读过教训就不打扰）。
+        if (REMIND_TOOLS.has(exec.name) && lastRemindTurn !== turnCount && !lessonReadThisTurn()) {
+          const text = lessonReminder();
+          if (text) {
+            lastRemindTurn = turnCount;
+            extra.push({ type: 'text', text });
+          }
+        }
+        // 正文超长提醒：写进记忆仓库的文件超了建议长度就提示一句。
+        if ((exec.name === 'write' || exec.name === 'edit') && decision.value === undefined) {
+          const abs = memoryTargetOf(exec);
+          if (abs) {
+            const { length } = bodyLength(fs.readFileSync(abs, 'utf8'));
+            if (length > MEM_LIMIT) extra.push({ type: 'text', text: oversizeWarning(path.basename(abs), length) });
+          }
+        }
+        if (!extra.length) return decision;
+        return { ...decision, content: [...(decision.content || result.content || []), ...extra] };
       } catch {
         return decision;
       }
@@ -2109,6 +2181,20 @@ export function apply(ctx) {
               const body = JSON.parse(await readBody(req));
               setProtected(String(body.file || ''), Boolean(body.protected));
               sendJson(res, 200, snapshot());
+            } catch (err) {
+              sendJson(res, 400, { error: err.message });
+            }
+          },
+        }),
+        webCtx.webServer.register({
+          kind: 'exact',
+          path: KEEP_ROUTE,
+          handler: async (req, res) => {
+            if (req.method !== 'POST') return sendJson(res, 405, { error: 'method' });
+            try {
+              const body = JSON.parse(await readBody(req));
+              const kept = keepEntry(String(body.file || ''));
+              sendJson(res, 200, { ...snapshot(), kept });
             } catch (err) {
               sendJson(res, 400, { error: err.message });
             }
