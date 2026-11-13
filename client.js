@@ -1371,8 +1371,22 @@ window.__ModuleLoader__.load({
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(payload),
         });
-        const body = await res.json();
-        if (!res.ok) throw new Error(body.error || '操作失败');
+        // 宿主没重启时新路由还不存在：404 常常带着空 body，直接 res.json() 会抛
+        // 「Unexpected end of JSON input」，把人误导成数据坏了。这里先读文本再解析。
+        const raw = await res.text();
+        let body = {};
+        try {
+          body = raw ? JSON.parse(raw) : {};
+        } catch {
+          body = {};
+        }
+        if (!res.ok) {
+          // 404/405 基本都是宿主还没重启、这条新路由不存在；别让人以为数据坏了。
+          if (res.status === 404 || res.status === 405 || !raw) {
+            throw new Error(`宿主还没加载这个接口（${path}，HTTP ${res.status || '空回包'}）：重启一次 DeepSeek Harness 再试`);
+          }
+          throw new Error(body.error || raw.slice(0, 120));
+        }
         // 只有带 entries 的回包才是新快照；别的（例如打开位置）不能拿来整体替换页面状态，
         // 否则 entries 变 undefined，整页卡片会一起消失。
         if (body && Array.isArray(body.entries)) applyData(body);
