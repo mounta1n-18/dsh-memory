@@ -29,7 +29,23 @@ const TURNS = path.join(TIDY, 'turns.json'); // 全局用户轮计数 {count}
 const WINDOW_TURNS = 100; // 回忆率的统计窗口 = 最近 100 个用户轮
 const COMPRESS_EVERY = 100; // 每 100 轮触发一次压缩判定
 const HIGH_FREQ = 11; // 窗口内 >=11 次 = 高频，不送压缩
-const STALE_DAYS = 14; // 无回忆 + 超过这么多天 → 报备删除
+// 记忆越多，删得越狠（2026-11-15 用户口径）：总量按对数增长，条目越多、淘汰线越紧。
+const PRUNE_DAYS_MAX = 45; // 条目很少时给足观察期
+const PRUNE_DAYS_MIN = 10; // 条目很多时收紧到 10 天
+const PRUNE_BASE = 8; // 8 条以内：被读过 1 次就算活
+
+/** N 条时的淘汰窗口（天）：45 → 10，随条目数按 log2 递减。 */
+function pruneDays(total) {
+  const n = Math.max(1, Number(total) || 1);
+  const days = PRUNE_DAYS_MAX / (1 + Math.log2(Math.max(1, n / PRUNE_BASE)));
+  return Math.max(PRUNE_DAYS_MIN, Math.min(PRUNE_DAYS_MAX, Math.round(days)));
+}
+
+/** N 条时「不算白记」的最低回忆次数：8 条以内 1 次，之后每翻一倍加 1，逼着条目争取被读。 */
+function pruneMinHits(total) {
+  const n = Math.max(1, Number(total) || 1);
+  return Math.max(1, 1 + Math.round(Math.log2(Math.max(1, n / PRUNE_BASE))));
+}
 const COMPRESS = path.join(TIDY, 'compress.json'); // {startedAt, finishedAt, stage, reason, files, detail}
 const COMPRESS_STALE_MS = 15 * 60_000; // 有 startedAt 无 finishedAt 且超过这么久 → 判定上次中断
 const COMPRESS_ENDPOINT = process.env.MEMORY_COMPRESS_ENDPOINT || 'https://api.deepseek.com/chat/completions';
@@ -225,7 +241,14 @@ function recallOverview() {
  * 索引常驻归常驻，模型动手时经常不回头看；这条提醒是「场景触发」而不是「等待自觉」。
  * 每轮最多一次，且该轮已经读过教训就不再打扰。
  */
-const REMIND_TOOLS = new Set(['write', 'edit', 'pwsh', 'computer_use', 'memory_delete']);
+const REMIND_TOOLS = new Set(['write', 'edit', 'pwsh', 'computer_use', 'memory_delete', 'memory_update']);
+/**
+ * 破坏性命令的硬闸门（2026-11-15 用户要「最好是硬限制」）：
+ * 命中这些命令、而这一轮又没读过任何教训时，直接拒绝一次——先读教训再重试。
+ * 只拦「删/覆盖/杀进程/改注册表」这类不可逆动作，日常命令不受影响。
+ */
+const DANGER_CMD =
+  /\b(Remove-Item|rmdir|rd\s+\/s|del\s+\/[fsq]|rm\s+-[a-z]*r|git\s+(reset\s+--hard|clean\s+-[a-z]*f)|Stop-Process|taskkill|Format-Volume|Clear-Disk|reg\s+delete|Unregister-ScheduledTask|Remove-ItemProperty)\b/i;
 
 function lessonEntries() {
   try {
@@ -309,6 +332,150 @@ function keywordTooLong(keywords) {
     return `关键词最多 ${KEYWORD_SEG_COUNT} 段（含分类），现在是 ${parts.length} 段：${parts.join('/')}。留最能勾人的那几段。`;
   }
   return null;
+}
+
+/**
+ * 空泛词：写进关键词等于没写（2026-11-13 用户口径「插件、记忆、回忆这种空泛词等于没写」）。
+ * 只有整条都是这类词才拦——单独出现一个，模型可能确实没法更具体。
+ */
+const VAGUE_SEGMENTS = new Set([
+  '插件',
+  '记忆',
+  '工具',
+  '说明',
+  '说明书',
+  '回忆',
+  '操作',
+  '方法',
+  '使用',
+  '经验',
+  '重要',
+  '内容',
+  '杂项',
+  '其他',
+  '一般',
+  '技巧',
+  '注意事项',
+]);
+
+function keywordTooVague(keywords) {
+  const parts = String(keywords || '')
+    .split('/')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const body = parts.slice(1); // 第一段是分类，不参与
+  if (!body.length) return null;
+  if (body.every((p) => VAGUE_SEGMENTS.has(p))) {
+    return `关键词全是空泛词（${body.join('/')}），等于没写：写「什么场景下必须点开这条」，像「删家目录 / 装完即验收 / 会话注入」这种具体到动作的。`;
+  }
+  return null;
+}
+
+/** 去掉首段分类后的关键词：查重只比「具体内容」，别让所有教训都因为「教训」二字而互相相似。 */
+function keywordsWithoutCategory(keywords) {
+  const parts = String(keywords || '')
+    .split('/')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return (CATEGORIES.includes(parts[0]) ? parts.slice(1) : parts).join('/');
+}
+
+/** 切成可比较的 token：英文按整词（>2 字），中文按 2 字滑窗。 */
+function memoryTokens(text) {
+  const out = new Set();
+  for (const seg of String(text || '')
+    .toLowerCase()
+    .split(/[^a-z0-9\u4e00-\u9fff]+/)) {
+    if (!seg) continue;
+    if (/^[a-z0-9]+$/.test(seg)) {
+      if (seg.length > 2) out.add(seg);
+      continue;
+    }
+    if (seg.length <= 2) out.add(seg);
+    else for (let i = 0; i < seg.length - 1; i += 1) out.add(seg.slice(i, i + 2));
+  }
+  return out;
+}
+
+const DUPE_SAME = 0.55; // 到这个程度就是同一个条目：不许新建，去改它
+const DUPE_RELATED = 0.3; // 到这个程度先看一眼再决定（现有 37 条里最高一对是 0.367）
+
+/**
+ * 新建之前的查重（2026-11-15 用户口径）：模型爱开新条目，所以强制它先想清楚
+ * 「相似 → 稍作修改」「相同 → 不建」「相关 → 并进原有条目」。
+ * 只读索引就能算，不花模型调用。
+ */
+function dupeReport(name, keywords) {
+  const mine = memoryTokens(`${name} ${keywordsWithoutCategory(keywords)}`);
+  const rows = [];
+  for (const e of readEntries()) {
+    const base = e.file.replace(/\.md$/i, '');
+    const theirs = memoryTokens(`${base} ${keywordsWithoutCategory(e.keywords)}`);
+    let inter = 0;
+    for (const t of mine) if (theirs.has(t)) inter += 1;
+    if (!inter) continue;
+    const overlap = inter / Math.min(mine.size, theirs.size);
+    const jaccard = inter / (mine.size + theirs.size - inter);
+    const score = 0.6 * overlap + 0.4 * jaccard;
+    rows.push({ file: e.file, keywords: e.keywords, score: Number(score.toFixed(3)) });
+  }
+  rows.sort((a, b) => b.score - a.score);
+  const top = rows.slice(0, 3).filter((r) => r.score >= 0.2);
+  const best = top[0];
+  const level = !best ? 'none' : best.score >= DUPE_SAME ? 'same' : best.score >= DUPE_RELATED ? 'related' : 'none';
+  return { level, top };
+}
+
+/** 这一轮读过哪些记忆（查重的 `checked` 要能对上真读过的，不许凭空报名字）。 */
+function readThisTurn(files) {
+  const turn = turnCount || 1;
+  const want = new Set(files.map((f) => (String(f).endsWith('.md') ? String(f) : `${f}.md`)));
+  const events = readJson(RECALL, []);
+  const hit = new Set();
+  for (const ev of Array.isArray(events) ? events : []) {
+    if (ev && ev.turn === turn && want.has(String(ev.file))) hit.add(String(ev.file));
+  }
+  return hit;
+}
+
+function dupeHint(top) {
+  const lines = top.map((r) => `  · ${r.file}（相似 ${r.score}）${r.keywords}`).join('\n');
+  return `${lines}`;
+}
+
+/**
+ * `memory_write` 的查重闸门。三种放行方式，模型必须选一个并说清：
+ * 改已有条目（memory_update）、并进已有条目（memory_update + append）、
+ * 或者确认「看过、确实要单开」（checked + new_reason）。
+ */
+function assertNoDupe(args, name, keywords) {
+  const report = dupeReport(name, keywords);
+  if (report.level === 'none') return report;
+  const checked = oneLine(args?.checked, 200);
+  const reason = oneLine(args?.new_reason, 200);
+  const same = report.level === 'same';
+  if (!checked) {
+    const head = same
+      ? `这跟已有记忆几乎是一条（${report.top[0].file}，相似 ${report.top[0].score}），先别新建：`
+      : '有相近的记忆，先看一眼再决定要不要新建：';
+    throw new Error(
+      `${head}\n${dupeHint(report.top)}\n` +
+        '用 memory_read 一次读完（可传多个），然后三选一：相似 → memory_update 稍作修改；相关 → memory_update + append:true 并进去（增添内容）；' +
+        '相同 → 不建。确实该单开（例如对象或场景确实不同）→ 重试 memory_write，把 checked 填成你读过的那几条名称（如 "a,b"），并在 new_reason 里一句话说清区别。',
+    );
+  }
+  const named = checked
+    .split(/[,，、\s]+/)
+    .map((s) => s.trim().replace(/\.md$/i, ''))
+    .filter(Boolean);
+  const unread = named.filter((f) => !readThisTurn([f]).size);
+  if (unread.length) {
+    throw new Error(`checked 里的 ${unread.join('、')} 这一轮没读过（memory_read 才算），别凭空报名字：先读，再回来写。`);
+  }
+  if (!reason || Array.from(reason).length < 8) {
+    throw new Error(`补一句 new_reason：为什么不能并进 ${report.top.map((r) => r.file).join(' / ')}（至少 8 个字，讲清对象/场景的差别）。`);
+  }
+  return report;
 }
 
 /**
@@ -606,7 +773,7 @@ function approveFile(file) {
 
 /**
  * 保留：用户否决「待删除」判定。只把复核日刷到今天（索引第 6 列 + 正文 reviewed），
- * 不同 STALE_DAYS 一起走就立刻又变回待删除，所以两边必须同时改。
+ * 否则会话间隔一过就会立刻又变回待删除，所以两边必须同时改。
  */
 function keepEntry(file) {
   if (!/^[\w.-]+\.md$/.test(file) || file === 'MEMORY.md') throw new Error('文件名非法');
@@ -808,7 +975,9 @@ let compressRunning = false;
 const WRITE_TOOL_DESCRIPTION = [
   '记住一件以后还会用到的事。任务收尾时过一遍：有没有新的稳定事实、可复用的做法、或一次纠正？有就写一条，最多一条。',
   '首词是分类：资料 / 教训 / 说明书 / 其它（项目记忆 只由用户点「大脑」按钮生成）。',
+  '写之前先想：这件事是不是已经有记忆说过了？先 memory_read 看相近的那条——相似就改它、相关就把内容并进去、相同就别新建；插件会按名称和关键词查重，相近的会把你拦下来。',
   'keywords 是钩子，不是句子：写「什么场景下必须点开这条」，但要短——每段 ≤10 字、1~4 段用 / 分隔。像标题党一样勾人，别写成「……前看」「……怎么用」这种尾巴。空泛词（插件、记忆、工具、说明、回忆）等于没写。',
+  '钩子要泛化到「场面」：写成 `删家目录`、`会话注入`、`MCP 连不上` 这种一看就知道自己正处在那场面里的词，别写成一次性任务名或只有你懂的缩写——多个场合都能命中才点得进来。',
   '· 教训：`教训/删家目录/重装DSH` · `教训/装完即验收` · `教训/会话注入/自拼消息`。',
   '· 资料：`资料/中文乱码/代码页` · `资料/称呼/基本信息`。',
   '· 说明书：`说明书/MCP/懒加载` · `说明书/记忆读写/索引`。',
@@ -828,6 +997,15 @@ const WRITE_TOOL_PARAMETERS = {
     description: { type: 'string', description: '一句话说清这是什么、什么时候该读。' },
     body: { type: 'string', description: '正文，Markdown，写完整句子；2000 字以内通常够用，内容确实需要可以更长。' },
     type: { type: 'string', description: '可选：reference / profile / 其他，默认 reference。' },
+    checked: {
+      type: 'string',
+      description:
+        '可选：新建前你 memory_read 过的相近记忆名称（逗号分隔）。只有被相近记忆拦下来、并确认要单独开一条时才填——插件会核对这几条本轮是否真读过。',
+    },
+    new_reason: {
+      type: 'string',
+      description: '可选：一句话说清为什么不能并进已有的相近记忆（对象/场景的差别）。和 checked 一起用。',
+    },
   },
   required: ['name', 'keywords', 'description', 'body'],
   additionalProperties: false,
@@ -950,16 +1128,19 @@ function recordMemoryCall(exec) {
 function compressPlan() {
   const hits = recallHits();
   const plan = [];
-  for (const entry of readEntries()) {
+  const all = readEntries();
+  // 淘汰线随条目数收紧：条目越多，同样的「零回忆 + 老」越容易归入重压档。
+  const staleDays = pruneDays(all.length);
+  for (const entry of all) {
     if (!entry.enabled || entry.protected) continue;
     const count = hits.get(entry.file) || 0;
     const age = daysSince(entry.reviewed);
     const body = readMemoryBody(entry.file);
     let level;
     if (count >= HIGH_FREQ) level = 'skip-high';
-    else if (count === 0 && Number.isFinite(age) && age >= STALE_DAYS) level = 'stale';
+    else if (count === 0 && Number.isFinite(age) && age >= staleDays) level = 'stale';
     else if (count === 0) level = 'heavy';
-    else if (count === 1 && Number.isFinite(age) && age >= STALE_DAYS) level = 'heavy';
+    else if (count === 1 && Number.isFinite(age) && age >= staleDays) level = 'heavy';
     else level = 'light';
     plan.push({ file: entry.file, keywords: entry.keywords, hits: count, age, level, body });
   }
@@ -1602,12 +1783,16 @@ function snapshot() {
   // 回忆率与「待删除」都是可推导的统计量，不进索引表：索引只存人写的事实。
   const rates = recallRates();
   const windowSize = Math.min(WINDOW_TURNS, turnCount);
+  // 条目越多淘汰越紧（对数）：这是让总量增长趋缓的执行端。
+  const prune = { total: entries.length, days: pruneDays(entries.length), minHits: pruneMinHits(entries.length) };
   for (const e of entries) {
     const hits = rates.get(e.file);
     e.recallRate = windowSize ? hits || 0 : null;
     const reviewedAge = daysSince(e.reviewed);
-    // 待删除 = 窗口内一次没被回忆 + 复核日已过 STALE_DAYS；锁定的、被停用的不参与。
-    e.pendingDelete = Boolean(windowSize && !hits && Number.isFinite(reviewedAge) && reviewedAge >= STALE_DAYS && e.enabled && !e.protected);
+    // 待删除 = 窗口内回忆次数低于当前门槛 + 复核日超过当前淘汰窗口；锁定的、停用的不参与。
+    e.pendingDelete = Boolean(
+      windowSize && (hits || 0) < prune.minHits && Number.isFinite(reviewedAge) && reviewedAge >= prune.days && e.enabled && !e.protected,
+    );
   }
 
   // 压缩流水线状态：compressed.json 只有 startedAt 没有 finishedAt 就是没跑完。
@@ -1635,6 +1820,8 @@ function snapshot() {
     turns: turnCount,
     windowTurns: windowSize,
     recall: recallOverview(),
+    // 当前淘汰线：条目越多，days 越小、minHits 越大（面板照这个解释「为什么这条被标待删除」）。
+    prune,
     compress: {
       running,
       interrupted: unfinished && !running,
@@ -1884,8 +2071,12 @@ export function apply(ctx) {
             if (lengthProblem) throw new Error(lengthProblem);
             const kwProblem = lessonKeywordProblem(keywords);
             if (kwProblem) throw new Error(kwProblem);
+            const vagueProblem = keywordTooVague(keywords);
+            if (vagueProblem) throw new Error(vagueProblem);
             if (!description) throw new Error('description 不能为空，一句话说清什么时候读');
             if (!body) throw new Error('body 不能为空');
+            // 查重闸门：先想清楚「相似/相同/相关」，再决定新建还是并进已有条目。
+            const dupe = assertNoDupe(args, name, keywords);
             const attrs = [`name: ${name}`, `description: ${description}`, `type: ${type}`, `reviewed: ${today()}`];
             const target = path.join(MEM, file);
             fs.writeFileSync(target, joinDoc(attrs, body), 'utf8');
@@ -1901,7 +2092,11 @@ export function apply(ctx) {
               throw new Error(`索引写入失败，已撤回文件：${err.message}`);
             }
             return {
-              text: `已记下：${file}\n关键词：${keywords}${lengthNote(file, body)}`,
+              text:
+                `已记下：${file}\n关键词：${keywords}${lengthNote(file, body)}` +
+                (dupe.top.length && dupe.level === 'none'
+                  ? `\n（跟 ${dupe.top.map((r) => r.file).join('、')} 有轻微相似但已放行；下次相关的内容记得并进已有条目。）`
+                  : ''),
             };
           },
         }),
@@ -1915,8 +2110,9 @@ export function apply(ctx) {
           name: 'memory_update',
           description: [
             '发现某条记忆过时、有误或不全时，顺手订正它。只传要改的字段，其余保持原样。',
+            '新内容跟已有记忆相关（不是过时，而是同一件事又有了新经验）时，用 append:true 把这段并进正文尾部，而不是另开一条。',
             '换关键词时第一段仍是分类：资料 / 教训 / 说明书 / 其它（项目记忆 只能由用户点「大脑」生成）。',
-            '关键词按「什么场景下必须点开这条」写，越具体越勾人越好；空泛词（插件、记忆、工具）等于没写，也别写 422 / 报错 这类事后症状。',
+            '关键词按「什么场景下必须点开这条」写，越短越勾人越好；空泛词（插件、记忆、工具）等于没写，也别写 422 / 报错 这类事后症状。',
             '锁定的记忆会被拒绝，需要用户先在设置页解锁。',
           ].join(' '),
           parameters: {
@@ -1926,10 +2122,14 @@ export function apply(ctx) {
               keywords: {
                 type: 'string',
                 description:
-                  '可选：新的关键词，写「什么场景下必须点开它」，像标题党一样勾人；1~5 段用 / 分隔，第一段必须是分类。',
+                  '可选：新的关键词，写「什么场景下必须点开它」，像标题党一样勾人；1~4 段用 / 分隔，第一段必须是分类，每段 ≤10 字。',
               },
               description: { type: 'string', description: '可选：新的一句话描述。' },
-              body: { type: 'string', description: '可选：新的正文，整段替换。' },
+              body: { type: 'string', description: '可选：新的正文，整段替换（append:true 时改为追加到正文末尾）。' },
+              append: {
+                type: 'boolean',
+                description: '可选：为 true 时把 body 追加到现有正文末尾（中间空一行），而不是整段替换。适合「同一件事又有了新经验」。',
+              },
               type: { type: 'string', description: '可选：新的类型。' },
             },
             required: ['name'],
@@ -1952,7 +2152,9 @@ export function apply(ctx) {
             if (args?.description) setAttr(attrs, 'description', oneLine(args.description));
             if (args?.type) setAttr(attrs, 'type', oneLine(args.type, 24));
             setAttr(attrs, 'reviewed', today());
-            const body = args?.body ? String(args.body).trim() : doc.body;
+            const appendMode = Boolean(args?.append);
+            const incoming = args?.body ? String(args.body).trim() : '';
+            const body = appendMode ? (incoming ? `${doc.body}\n\n${incoming}` : doc.body) : incoming || doc.body;
             if (!body) throw new Error('body 不能为空');
             // 关键词先校验再落盘：否则正文改了、关键词被拒，留下半截修改
             const nextKeywords = args?.keywords ? oneLine(args.keywords, 80) : '';
@@ -1962,14 +2164,17 @@ export function apply(ctx) {
               if (lengthProblem) throw new Error(lengthProblem);
               const kwProblem = lessonKeywordProblem(nextKeywords);
               if (kwProblem) throw new Error(kwProblem);
+              const vagueProblem = keywordTooVague(nextKeywords);
+              if (vagueProblem) throw new Error(vagueProblem);
             }
+            if (appendMode && !incoming) throw new Error('append:true 时要传 body（要追加的那段）');
             fs.writeFileSync(path.join(MEM, file), joinDoc(attrs, body), 'utf8');
             if (nextKeywords) updateCell(file, 2, nextKeywords);
             if (args?.type) updateCell(file, 4, oneLine(args.type, 24));
             if (args?.description) updateCell(file, 5, oneLine(args.description));
             updateCell(file, 6, today());
             return {
-              text: `已订正：${file}${lengthNote(file, body)}`,
+              text: `${appendMode ? '已追加' : '已订正'}：${file}${lengthNote(file, body)}`,
             };
           },
         }),
@@ -2046,6 +2251,16 @@ export function apply(ctx) {
             kind: 'deny',
             reason: '不要搜索记忆仓库目录；改用 memory_read，按大纲里的名称或关键词取正文。',
           };
+        }
+        // 破坏性命令：这一轮还没读教训就拦一次，先读再重试（硬限制，不只靠提醒）。
+        if (exec.name === 'pwsh' && DANGER_CMD.test(String(args.command || '')) && !lessonReadThisTurn()) {
+          const line = lessonHooksLine();
+          if (line) {
+            return {
+              kind: 'deny',
+              reason: `这条命令是破坏性的，先看一眼教训再跑——这一轮你还没读任何【教训】：${line}。\n用 memory_read 读完相关的那条（可一次传多条），再原样重试这条命令。`,
+            };
+          }
         }
         // 删除前留一份正文与元数据：删完文件就没了，详情里要显示真正被删掉的内容。
         if (exec.name === 'memory_delete' && exec.callId) {

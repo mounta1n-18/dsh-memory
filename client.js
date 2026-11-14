@@ -2099,6 +2099,16 @@ window.__ModuleLoader__.load({
                     ? '教训 —'
                     : `教训 ${data.recall.lessonTurns} 轮（${data.recall.lessonRate}%）`,
                 ),
+                data.prune
+                  ? h(
+                      'span',
+                      {
+                        title: `条目变多，淘汰线自动收紧：现在 ${data.prune.total} 条 → 复核超过 ${data.prune.days} 天、且最近 100 轮被读少于 ${data.prune.minHits} 次，就标「待删除」。点「保留」可以否决。`,
+                        style: { opacity: 0.75 },
+                      },
+                      `淘汰线 >${data.prune.days} 天 / 回忆<${data.prune.minHits}`,
+                    )
+                  : null,
               ),
             )
           : null,

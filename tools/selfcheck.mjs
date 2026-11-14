@@ -470,9 +470,9 @@ eq('设置页改关键词同样拦长句', r.code, 400);
 ok('拦住时给出改写提示', /写成句子了/.test(r.body?.error || ''), r.body?.error);
 
 // 正文长度：2000 字以内静默，超过只提一句（用户口径 2026-10-28：别用「警告」把人吓短）
-const shortBody = write.execute({ name: 'len-short', keywords: '其它/长度自检', description: '自检', body: '甲'.repeat(600) });
+const shortBody = write.execute({ name: 'len-short', keywords: '其它/短正文静默', description: '自检', body: '甲'.repeat(600) });
 ok('600 字静默', !/建议长度/.test(shortBody.text), shortBody.text.slice(-60));
-const longBody = write.execute({ name: 'len-long', keywords: '其它/长度自检', description: '自检', body: '乙'.repeat(2100) });
+const longBody = write.execute({ name: 'len-long', keywords: '其它/长正文提示', description: '自检', body: '乙'.repeat(2100) });
 ok('2100 字只提示不拦截', /建议 2000 字以内/.test(longBody.text), longBody.text.slice(-90));
 ok(
   '提示措辞与定稿一致',
@@ -1031,6 +1031,87 @@ console.log('\n[15] 保留（否决待删除）与动手前提醒');
   state.tools.get('memory_read').execute({ file: 'noahs-ark' });
   const afterRead = await afterTool(state, 'write', { file_path: path.join(MEM, 'pl-mcd.md') });
   ok('本轮已读教训就不再提醒', !(afterRead.content || []).some((b) => String(b.text || '').includes('【教训提醒】')));
+}
+
+console.log('\n[16] 新建前查重 / 并进已有条目 / 空泛词 / 淘汰线');
+{
+  userTurn();
+  // 先造一条「基准」，再写一条关键词几乎一样的：必须被拦下来。
+  write.execute({ name: 'dup-base', keywords: '说明书/查重基准/自检', description: '自检基准', body: '基准正文' });
+  threw = '';
+  try {
+    write.execute({ name: 'dup-second', keywords: '说明书/查重基准/自检', description: '自检重复', body: '重复正文' });
+  } catch (err) {
+    threw = err.message;
+  }
+  ok('关键词几乎一样的新建被拦', /几乎是一条|有相近的记忆/.test(threw), threw.slice(0, 80));
+  ok('拦截时把相近的条目列出来', /dup-base\.md/.test(threw), threw.slice(0, 200));
+  ok('拦截时给出三条出路（改/并/说清）', /memory_update/.test(threw) && /append:true/.test(threw) && /new_reason/.test(threw));
+
+  // 凭空报名字不行：checked 里的条目本轮必须真读过。
+  threw = '';
+  try {
+    write.execute({ name: 'dup-third', keywords: '说明书/查重基准/自检', description: '自检', body: '正文', checked: 'dup-base', new_reason: '这是另一个对象的独立情况' });
+  } catch (err) {
+    threw = err.message;
+  }
+  ok('checked 里没读过的名字被拒', /没读过/.test(threw), threw.slice(0, 80));
+
+  // 真读过 + 说清区别 → 放行。
+  read.execute({ file: 'dup-base' });
+  const allowed = write.execute({
+    name: 'dup-fourth',
+    keywords: '说明书/查重基准/自检',
+    description: '自检',
+    body: '另一个对象',
+    checked: 'dup-base',
+    new_reason: '这是另一台机器上的另一种连不上，对象不同',
+  });
+  ok('读过并说清区别后放行', /已记下/.test(allowed.text), allowed.text.slice(0, 60));
+
+  // 只读不解释也不许。
+  userTurn();
+  read.execute({ file: 'dup-base' });
+  threw = '';
+  try {
+    write.execute({ name: 'dup-fifth', keywords: '说明书/查重基准/自检', description: '自检', body: '正文', checked: 'dup-base' });
+  } catch (err) {
+    threw = err.message;
+  }
+  ok('只给 checked 没给理由被拒', /new_reason/.test(threw), threw.slice(0, 80));
+
+  // 空泛词：整条只有「插件/记忆/工具」这种，等于没写。
+  threw = '';
+  try {
+    write.execute({ name: 'vague-one', keywords: '说明书/插件/工具', description: '自检', body: '正文' });
+  } catch (err) {
+    threw = err.message;
+  }
+  ok('整条都是空泛词被拒', /空泛词/.test(threw), threw.slice(0, 80));
+
+  // 并进已有条目：append:true 追加在正文尾部，不是覆盖。
+  const appended = update.execute({ name: 'dup-base', body: '追加的一段', append: true });
+  ok('append:true 回「已追加」', /已追加/.test(appended.text), appended.text.slice(0, 40));
+  const merged = fs.readFileSync(path.join(MEM, 'dup-base.md'), 'utf8');
+  ok('追加没覆盖原正文', merged.includes('基准正文') && merged.includes('追加的一段'));
+
+  // 淘汰线随条目数收紧：条目越多，窗口天数越小、最低回忆次数越大。
+  const snap = await call(state, '/dsh-memory/status');
+  const pr = snap.body.prune;
+  ok('状态里带淘汰线', Boolean(pr) && typeof pr.days === 'number' && typeof pr.minHits === 'number', JSON.stringify(pr));
+  const daysOf = (n) => Math.max(10, Math.min(45, Math.round(45 / (1 + Math.log2(Math.max(1, n / 8))))));
+  const hitsOf = (n) => Math.max(1, 1 + Math.round(Math.log2(Math.max(1, n / 8))));
+  eq('淘汰天数按条目数算出来', pr.days, daysOf(pr.total));
+  eq('最低回忆次数按条目数算出来', pr.minHits, hitsOf(pr.total));
+  ok('条目多于 8 条时已经收紧（天数 < 45）', pr.total <= 8 || pr.days < 45, JSON.stringify(pr));
+
+  // 破坏性命令的硬闸门：这一轮没读教训就拒一次，读过之后放行。
+  userTurn();
+  eq('没读教训时删目录被拦', await gate(state, 'pwsh', { command: 'Remove-Item -Recurse -Force C:\\tmp\\foo' }), 'deny');
+  eq('没读教训时 git reset --hard 被拦', await gate(state, 'pwsh', { command: 'git reset --hard HEAD~1' }), 'deny');
+  eq('普通命令不受影响', await gate(state, 'pwsh', { command: 'git status --short' }), 'pass');
+  read.execute({ file: 'noahs-ark' });
+  eq('读过教训后破坏性命令放行', await gate(state, 'pwsh', { command: 'Remove-Item -Recurse -Force C:\\tmp\\foo' }), 'pass');
 }
 
 console.log(`\n结果：${pass} 通过，${fails.length} 失败`);
