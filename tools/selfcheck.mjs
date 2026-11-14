@@ -398,7 +398,13 @@ ok(
   write.parameters.properties.keywords.description,
 );
 ok('教训正文要求写场景/链条/修复三段', /错误链条/.test(write.description) && /绕开与修复/.test(write.description));
-const mk = (keywords) => ({ name: 'tmp-check', keywords, description: '自检用', body: '自检正文' });
+const mk = (keywords) => ({
+  name: 'tmp-check',
+  keywords,
+  description: '自检用',
+  body: '自检正文',
+  dup_check: '只比了关键词，跟已有条目无关，新建',
+});
 let threw = '';
 try {
   write.execute(mk('身份/张三'));
@@ -447,20 +453,21 @@ const actOk = write.execute({
   keywords: '教训/批量删除家目录/清理缓存目录',
   description: '自检用',
   body: '自检正文',
+  dup_check: '只比了关键词，没有同类删目录的教训，判为无关，新建',
 });
 ok('动作短语放行', /已记下/.test(actOk.text), actOk.text.slice(0, 60));
 
 // 关键词是钩子不是句子（2026-11-13 用户口径）：段太长、段太多都要拒，并把该砍哪段说清楚。
 threw = '';
 try {
-  write.execute({ name: 'tmp-long', keywords: '教训/批量删除家目录前一定要先看清路径', description: '自检', body: '自检正文' });
+  write.execute({ name: 'tmp-long', keywords: '教训/批量删除家目录前一定要先看清路径', description: '自检', body: '自检正文', dup_check: '只比了关键词，判为无关，新建' });
 } catch (err) {
   threw = err.message;
 }
 ok('关键词写成长句被拒', /写成句子了/.test(threw) && /10 字/.test(threw), threw);
 threw = '';
 try {
-  write.execute({ name: 'tmp-seg', keywords: '教训/删目录/清缓存/装插件/改配置/卸插件', description: '自检', body: '自检正文' });
+  write.execute({ name: 'tmp-seg', keywords: '教训/删目录/清缓存/装插件/改配置/卸插件', description: '自检', body: '自检正文', dup_check: '只比了关键词，判为无关，新建' });
 } catch (err) {
   threw = err.message;
 }
@@ -470,9 +477,9 @@ eq('设置页改关键词同样拦长句', r.code, 400);
 ok('拦住时给出改写提示', /写成句子了/.test(r.body?.error || ''), r.body?.error);
 
 // 正文长度：2000 字以内静默，超过只提一句（用户口径 2026-10-28：别用「警告」把人吓短）
-const shortBody = write.execute({ name: 'len-short', keywords: '其它/短正文静默', description: '自检', body: '甲'.repeat(600) });
+const shortBody = write.execute({ name: 'len-short', keywords: '其它/短正文静默', description: '自检', body: '甲'.repeat(600), dup_check: '只比了关键词，判为无关，新建' });
 ok('600 字静默', !/建议长度/.test(shortBody.text), shortBody.text.slice(-60));
-const longBody = write.execute({ name: 'len-long', keywords: '其它/长正文提示', description: '自检', body: '乙'.repeat(2100) });
+const longBody = write.execute({ name: 'len-long', keywords: '其它/长正文提示', description: '自检', body: '乙'.repeat(2100), dup_check: '只比了关键词，判为无关，新建' });
 ok('2100 字只提示不拦截', /建议 2000 字以内/.test(longBody.text), longBody.text.slice(-90));
 ok(
   '提示措辞与定稿一致',
@@ -621,7 +628,7 @@ eq('索引缺失时新建失败', r.code, 400);
 ok('失败已撤回文件（不留孤儿）', !fs.existsSync(path.join(MEM, 'tmp-orphan.md')));
 let writeErr = '';
 try {
-  write.execute({ name: 'tmp-orphan2', keywords: '资料/自检', description: 'x', body: 'x' });
+  write.execute({ name: 'tmp-orphan2', keywords: '资料/自检', description: 'x', body: 'x', dup_check: '只比了关键词，跟已有条目无关，新建' });
 } catch (err) {
   writeErr = err.message;
 }
@@ -1033,67 +1040,73 @@ console.log('\n[15] 保留（否决待删除）与动手前提醒');
   ok('本轮已读教训就不再提醒', !(afterRead.content || []).some((b) => String(b.text || '').includes('【教训提醒】')));
 }
 
-console.log('\n[16] 新建前查重 / 并进已有条目 / 空泛词 / 淘汰线');
+console.log('\n[16] 新建前查重（模型自己判断）/ 并进已有条目 / 空泛词 / 淘汰线');
 {
   userTurn();
-  // 先造一条「基准」，再写一条关键词几乎一样的：必须被拦下来。
-  write.execute({ name: 'dup-base', keywords: '说明书/查重基准/自检', description: '自检基准', body: '基准正文' });
+  const base = { description: '自检', body: '正文' };
+  // 缺少查重结论 → 不许写。
   threw = '';
   try {
-    write.execute({ name: 'dup-second', keywords: '说明书/查重基准/自检', description: '自检重复', body: '重复正文' });
+    write.execute({ name: 'dup-a', keywords: '说明书/查重基准/自检', ...base });
   } catch (err) {
     threw = err.message;
   }
-  ok('关键词几乎一样的新建被拦', /几乎是一条|有相近的记忆/.test(threw), threw.slice(0, 80));
-  ok('拦截时把相近的条目列出来', /dup-base\.md/.test(threw), threw.slice(0, 200));
-  ok('拦截时给出三条出路（改/并/说清）', /memory_update/.test(threw) && /append:true/.test(threw) && /new_reason/.test(threw));
+  ok('没有 dup_check 被拒', /先查重/.test(threw) && /dup_check/.test(threw), threw.slice(0, 80));
 
-  // 凭空报名字不行：checked 里的条目本轮必须真读过。
+  // 结论太短、没有判定词 → 都不算想过。
   threw = '';
   try {
-    write.execute({ name: 'dup-third', keywords: '说明书/查重基准/自检', description: '自检', body: '正文', checked: 'dup-base', new_reason: '这是另一个对象的独立情况' });
+    write.execute({ name: 'dup-b', keywords: '说明书/查重基准/自检', ...base, dup_check: '新建' });
   } catch (err) {
     threw = err.message;
   }
-  ok('checked 里没读过的名字被拒', /没读过/.test(threw), threw.slice(0, 80));
+  ok('结论太短被拒', /太短/.test(threw), threw.slice(0, 80));
+  threw = '';
+  try {
+    write.execute({ name: 'dup-c', keywords: '说明书/查重基准/自检', ...base, dup_check: '我随便写了一句关于这个工具的话' });
+  } catch (err) {
+    threw = err.message;
+  }
+  ok('结论里没有判定词被拒', /判定词/.test(threw), threw.slice(0, 80));
 
-  // 真读过 + 说清区别 → 放行。
-  read.execute({ file: 'dup-base' });
+  // 结论里报了名字，本轮就必须真读过。
+  threw = '';
+  try {
+    write.execute({ name: 'dup-d', keywords: '说明书/查重基准/自检', ...base, dup_check: '跟 noahs-ark 不同，判为无关，新建' });
+  } catch (err) {
+    threw = err.message;
+  }
+  ok('提到没读过的条目被拒', /没读过/.test(threw), threw.slice(0, 80));
+
+  // 读过 + 说清 → 放行，回执里带查重结论。
+  read.execute({ file: 'noahs-ark' });
   const allowed = write.execute({
-    name: 'dup-fourth',
+    name: 'dup-e',
     keywords: '说明书/查重基准/自检',
-    description: '自检',
-    body: '另一个对象',
-    checked: 'dup-base',
-    new_reason: '这是另一台机器上的另一种连不上，对象不同',
+    ...base,
+    dup_check: '跟 noahs-ark 都涉及删目录，读了全文发现对象是家目录，这条是 mklink 目录，判为无关，新建',
   });
-  ok('读过并说清区别后放行', /已记下/.test(allowed.text), allowed.text.slice(0, 60));
+  ok('读过全文后放行', /已记下/.test(allowed.text), allowed.text.slice(0, 60));
+  ok('回执带上查重结论', /查重结论/.test(allowed.text), allowed.text.slice(0, 120));
 
-  // 只读不解释也不许。
-  userTurn();
-  read.execute({ file: 'dup-base' });
-  threw = '';
-  try {
-    write.execute({ name: 'dup-fifth', keywords: '说明书/查重基准/自检', description: '自检', body: '正文', checked: 'dup-base' });
-  } catch (err) {
-    threw = err.message;
-  }
-  ok('只给 checked 没给理由被拒', /new_reason/.test(threw), threw.slice(0, 80));
+  // 只比关键词、不提任何名字 → 也算查过了，直接放行。
+  const kwOnly = write.execute({ name: 'dup-f', keywords: '资料/另一种咖啡/自检', ...base, dup_check: '只比了关键词：没有涉及咖啡或冲泡的条目，判为无关，新建' });
+  ok('只比关键词也能放行', /已记下/.test(kwOnly.text), kwOnly.text.slice(0, 60));
 
   // 空泛词：整条只有「插件/记忆/工具」这种，等于没写。
   threw = '';
   try {
-    write.execute({ name: 'vague-one', keywords: '说明书/插件/工具', description: '自检', body: '正文' });
+    write.execute({ name: 'vague-one', keywords: '说明书/插件/工具', ...base, dup_check: '只比了关键词，无关，新建' });
   } catch (err) {
     threw = err.message;
   }
   ok('整条都是空泛词被拒', /空泛词/.test(threw), threw.slice(0, 80));
 
   // 并进已有条目：append:true 追加在正文尾部，不是覆盖。
-  const appended = update.execute({ name: 'dup-base', body: '追加的一段', append: true });
+  const appended = update.execute({ name: 'dup-e', body: '追加的一段', append: true });
   ok('append:true 回「已追加」', /已追加/.test(appended.text), appended.text.slice(0, 40));
-  const merged = fs.readFileSync(path.join(MEM, 'dup-base.md'), 'utf8');
-  ok('追加没覆盖原正文', merged.includes('基准正文') && merged.includes('追加的一段'));
+  const merged = fs.readFileSync(path.join(MEM, 'dup-e.md'), 'utf8');
+  ok('追加没覆盖原正文', merged.includes('正文') && merged.includes('追加的一段'));
 
   // 淘汰线随条目数收紧：条目越多，窗口天数越小、最低回忆次数越大。
   const snap = await call(state, '/dsh-memory/status');

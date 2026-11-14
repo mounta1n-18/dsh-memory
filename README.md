@@ -71,7 +71,12 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
 
 **破坏性命令硬闸门（2026-11-15）**：提醒之外再加一道硬限制。`tools/pre-execute` 里匹配 `Remove-Item / rmdir / rd /s / del /f / rm -r / git reset --hard / git clean -f / Stop-Process / taskkill / Format-Volume / reg delete / Unregister-ScheduledTask`（常量 `DANGER_CMD`），若这一轮还没读过任何教训，**直接 deny 一次**并把教训钩子写进拒绝理由，模型必须 `memory_read` 之后再原样重试。普通命令（`git status`、跑自检、读文件）不受影响。
 
-**新建前查重闸门（2026-11-15）**：模型爱开新条目，所以 `memory_write` 先用名称 + 关键词算相似度（中文 2 字滑窗 + 英文整词的加权 Jaccard/重叠系数，`dupeReport()`），最高分 ≥ `0.55` 判「几乎是一条」、≥ `0.3` 判「相近」，命中就抛错并列出相近条目，逼模型三选一：**相似 → `memory_update` 稍作修改；相关 → `memory_update` + `append:true` 并进正文；相同 → 不建**。确实该单开时，传 `checked`（读过的那几条名称）+ `new_reason`（一句话说清对象/场景差别）才放行；`checked` 会被 `readThisTurn()` 对照 `recall.json` 核对——**没真读过就报名字会被拒**，于是查重顺带成了「回忆」的硬流程。另有 `keywordTooVague()`：整条关键词都是 `插件/记忆/工具/说明/回忆` 这类空泛词直接拒。
+**新建前查重闸门（2026-11-15，相似度由模型判断）**：模型爱开新条目，所以在 `memory_write` 上加一道**流程闸**而不是算分闸——相似度不交给代码算（字数窗口算出来的相似度既钝又会被措辞绕过），交给模型：先按索引里的名称和关键词判断，拿不准就用 `memory_read` 打开那几条读全文再判断。代码只做两件机械的事：
+
+1. **必须交结论**：`dup_check` 写清「比了哪些、判成相似/相同/相关/无关、所以新建还是并入」，至少 10 字且含判定词（新建 / 并入 / 相似 / 相关 / 相同 / 无关 / 单开），否则拒。
+2. **必须说真话**：结论里提到的任何条目名，都必须在这一轮真被 `memory_read` 读过（`readThisTurn()` 对 `recall.json`），否则拒——凭空报名字过不了。
+
+所以闸门同时是回忆的硬流程：想单开就得先翻出可能重复的那几条。判成相似就改原文、相关就 `memory_update` + `append:true` 并进去、相同就别建。另有 `keywordTooVague()`：整条关键词都是 `插件/记忆/工具/说明/回忆` 这类空泛词直接拒。
 
 **关键词口径（2026-11-13 再修订）**：关键词是**钩子**，不是摘要，也**不是句子**——写「**什么场景下必须点开这条**」，要具体、要勾人，像标题党一样让人在需要时非点不可；但要短：**每段 ≤10 字、1~4 段**（含分类），砍成名词 / 动词词组，别写「……前看」「……怎么用」这种尾巴。空泛词（`插件`、`记忆`、`工具`、`说明`、`回忆`）等于没写。
 - 资料 → 认得出来的对象（`中文乱码/代码页/BOM`、`称呼/基本信息`）；
@@ -153,7 +158,7 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
 
 ## 工具（`tools/`）
 
-- `selfcheck.mjs`：mock 一个 cordis ctx 把 `apply()` 整条路径跑起来（临时 `DSH_HOME`，不碰真实记忆库），覆盖装载面、大纲、闸门、status、分类约束、回忆统计、新建/删除、搜索、压缩、/remember、调用流水、保留与动手前提醒、查重/并条目/空泛词/淘汰线/破坏性命令闸门共 224 项。**改完先跑它，再考虑重启**：`node tools/selfcheck.mjs`。
+- `selfcheck.mjs`：mock 一个 cordis ctx 把 `apply()` 整条路径跑起来（临时 `DSH_HOME`，不碰真实记忆库），覆盖装载面、大纲、闸门、status、分类约束、回忆统计、新建/删除、搜索、压缩、/remember、调用流水、保留与动手前提醒、查重（模型自己判断）/并条目/空泛词/淘汰线/破坏性命令闸门共 225 项。**改完先跑它，再考虑重启**：`node tools/selfcheck.mjs`。
 - `tidy.mjs` + `run.cmd`：旧的「整理」worker，**已不再挂计划任务**（压缩不是定时任务）。保留作手动兜底：`node tools/tidy.mjs [--dry-run|--if-due]`，只写 `proposed/` 与 `status.json`。
 
 ## 未完成

@@ -371,62 +371,7 @@ function keywordTooVague(keywords) {
   return null;
 }
 
-/** 去掉首段分类后的关键词：查重只比「具体内容」，别让所有教训都因为「教训」二字而互相相似。 */
-function keywordsWithoutCategory(keywords) {
-  const parts = String(keywords || '')
-    .split('/')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  return (CATEGORIES.includes(parts[0]) ? parts.slice(1) : parts).join('/');
-}
-
-/** 切成可比较的 token：英文按整词（>2 字），中文按 2 字滑窗。 */
-function memoryTokens(text) {
-  const out = new Set();
-  for (const seg of String(text || '')
-    .toLowerCase()
-    .split(/[^a-z0-9\u4e00-\u9fff]+/)) {
-    if (!seg) continue;
-    if (/^[a-z0-9]+$/.test(seg)) {
-      if (seg.length > 2) out.add(seg);
-      continue;
-    }
-    if (seg.length <= 2) out.add(seg);
-    else for (let i = 0; i < seg.length - 1; i += 1) out.add(seg.slice(i, i + 2));
-  }
-  return out;
-}
-
-const DUPE_SAME = 0.55; // 到这个程度就是同一个条目：不许新建，去改它
-const DUPE_RELATED = 0.3; // 到这个程度先看一眼再决定（现有 37 条里最高一对是 0.367）
-
-/**
- * 新建之前的查重（2026-11-15 用户口径）：模型爱开新条目，所以强制它先想清楚
- * 「相似 → 稍作修改」「相同 → 不建」「相关 → 并进原有条目」。
- * 只读索引就能算，不花模型调用。
- */
-function dupeReport(name, keywords) {
-  const mine = memoryTokens(`${name} ${keywordsWithoutCategory(keywords)}`);
-  const rows = [];
-  for (const e of readEntries()) {
-    const base = e.file.replace(/\.md$/i, '');
-    const theirs = memoryTokens(`${base} ${keywordsWithoutCategory(e.keywords)}`);
-    let inter = 0;
-    for (const t of mine) if (theirs.has(t)) inter += 1;
-    if (!inter) continue;
-    const overlap = inter / Math.min(mine.size, theirs.size);
-    const jaccard = inter / (mine.size + theirs.size - inter);
-    const score = 0.6 * overlap + 0.4 * jaccard;
-    rows.push({ file: e.file, keywords: e.keywords, score: Number(score.toFixed(3)) });
-  }
-  rows.sort((a, b) => b.score - a.score);
-  const top = rows.slice(0, 3).filter((r) => r.score >= 0.2);
-  const best = top[0];
-  const level = !best ? 'none' : best.score >= DUPE_SAME ? 'same' : best.score >= DUPE_RELATED ? 'related' : 'none';
-  return { level, top };
-}
-
-/** 这一轮读过哪些记忆（查重的 `checked` 要能对上真读过的，不许凭空报名字）。 */
+/** 这一轮读过哪些记忆（查重结论里提到的条目要能对上真读过的，不许凭空报名字）。 */
 function readThisTurn(files) {
   const turn = turnCount || 1;
   const want = new Set(files.map((f) => (String(f).endsWith('.md') ? String(f) : `${f}.md`)));
@@ -438,44 +383,38 @@ function readThisTurn(files) {
   return hit;
 }
 
-function dupeHint(top) {
-  const lines = top.map((r) => `  · ${r.file}（相似 ${r.score}）${r.keywords}`).join('\n');
-  return `${lines}`;
-}
-
 /**
- * `memory_write` 的查重闸门。三种放行方式，模型必须选一个并说清：
- * 改已有条目（memory_update）、并进已有条目（memory_update + append）、
- * 或者确认「看过、确实要单开」（checked + new_reason）。
+ * 新建之前的查重闸门（2026-11-15 用户口径改版）：
+ * 相似度由**模型自己判断**——先看关键词筛一遍，觉得可能像就 memory_read 打开全文再判断。
+ * 代码不替它算相似度，只负责两件机械的事：逼它把结论写下来（dup_check），
+ * 以及核对「你说看过的，这一轮真读过」。
  */
-function assertNoDupe(args, name, keywords) {
-  const report = dupeReport(name, keywords);
-  if (report.level === 'none') return report;
-  const checked = oneLine(args?.checked, 200);
-  const reason = oneLine(args?.new_reason, 200);
-  const same = report.level === 'same';
-  if (!checked) {
-    const head = same
-      ? `这跟已有记忆几乎是一条（${report.top[0].file}，相似 ${report.top[0].score}），先别新建：`
-      : '有相近的记忆，先看一眼再决定要不要新建：';
+const DUP_VERDICTS = ['新建', '并入', '相似', '相关', '相同', '无关', '单开'];
+
+function assertDupeReviewed(args) {
+  const raw = String(args?.dup_check || '').trim();
+  if (!raw) {
     throw new Error(
-      `${head}\n${dupeHint(report.top)}\n` +
-        '用 memory_read 一次读完（可传多个），然后三选一：相似 → memory_update 稍作修改；相关 → memory_update + append:true 并进去（增添内容）；' +
-        '相同 → 不建。确实该单开（例如对象或场景确实不同）→ 重试 memory_write，把 checked 填成你读过的那几条名称（如 "a,b"），并在 new_reason 里一句话说清区别。',
+      '写之前先查重：扫一眼索引，按关键词判断有没有相似/相同/相关的记忆——相似 → memory_update 稍作修改；相关 → memory_update + append:true 并进去；' +
+        '相同 → 别建。确实要单开，就把结论写进 dup_check，例如「跟 dsh-session-422 的关键词都涉及会话注入，读了全文发现对象不同（一个是消息事件、一个是拼接 role），确定为新建」；' +
+        '只有关键词像、没看全文的也照实写「只比了关键词」。',
     );
   }
-  const named = checked
-    .split(/[,，、\s]+/)
-    .map((s) => s.trim().replace(/\.md$/i, ''))
-    .filter(Boolean);
-  const unread = named.filter((f) => !readThisTurn([f]).size);
+  const short = `查重结论太短了（${Array.from(raw).length} 字）：「${raw}」。写清你比了哪些条目、判成相似/相同/相关/无关、所以新建还是并入，至少 10 个字。`;
+  if (Array.from(oneLine(raw, 400)).length < 10) throw new Error(short);
+  const line = oneLine(raw, 400);
+  if (!DUP_VERDICTS.some((w) => line.includes(w))) {
+    throw new Error(`查重结论里要有判定词（新建 / 并入 / 相似 / 相关 / 相同 / 无关）：你现在写的是「${line}」。`);
+  }
+  const stems = readEntries().map((e) => e.file.replace(/\.md$/i, ''));
+  const named = stems.filter((s) => s && line.includes(s));
+  const unread = named.filter((n) => !readThisTurn([n]).size);
   if (unread.length) {
-    throw new Error(`checked 里的 ${unread.join('、')} 这一轮没读过（memory_read 才算），别凭空报名字：先读，再回来写。`);
+    throw new Error(
+      `你在查重结论里提了 ${unread.join('、')}，但这一轮没读过它（memory_read 才算），别凭空报名字：先读，再回来写。`,
+    );
   }
-  if (!reason || Array.from(reason).length < 8) {
-    throw new Error(`补一句 new_reason：为什么不能并进 ${report.top.map((r) => r.file).join(' / ')}（至少 8 个字，讲清对象/场景的差别）。`);
-  }
-  return report;
+  return { line, named, read: named.length > 0 };
 }
 
 /**
@@ -975,7 +914,7 @@ let compressRunning = false;
 const WRITE_TOOL_DESCRIPTION = [
   '记住一件以后还会用到的事。任务收尾时过一遍：有没有新的稳定事实、可复用的做法、或一次纠正？有就写一条，最多一条。',
   '首词是分类：资料 / 教训 / 说明书 / 其它（项目记忆 只由用户点「大脑」按钮生成）。',
-  '写之前先想：这件事是不是已经有记忆说过了？先 memory_read 看相近的那条——相似就改它、相关就把内容并进去、相同就别新建；插件会按名称和关键词查重，相近的会把你拦下来。',
+  '写之前先查重（必填 dup_check）：先按索引里的名称和关键词自己判断有没有相似/相同/相关的记忆，拿不准就用 memory_read 打开那几条读全文再判断——相似就改它、相关就把内容并进去（append:true）、相同就别新建。把结论写进 dup_check，提到名字就必须真读过。',
   'keywords 是钩子，不是句子：写「什么场景下必须点开这条」，但要短——每段 ≤10 字、1~4 段用 / 分隔。像标题党一样勾人，别写成「……前看」「……怎么用」这种尾巴。空泛词（插件、记忆、工具、说明、回忆）等于没写。',
   '钩子要泛化到「场面」：写成 `删家目录`、`会话注入`、`MCP 连不上` 这种一看就知道自己正处在那场面里的词，别写成一次性任务名或只有你懂的缩写——多个场合都能命中才点得进来。',
   '· 教训：`教训/删家目录/重装DSH` · `教训/装完即验收` · `教训/会话注入/自拼消息`。',
@@ -997,14 +936,12 @@ const WRITE_TOOL_PARAMETERS = {
     description: { type: 'string', description: '一句话说清这是什么、什么时候该读。' },
     body: { type: 'string', description: '正文，Markdown，写完整句子；2000 字以内通常够用，内容确实需要可以更长。' },
     type: { type: 'string', description: '可选：reference / profile / 其他，默认 reference。' },
-    checked: {
+    dup_check: {
       type: 'string',
       description:
-        '可选：新建前你 memory_read 过的相近记忆名称（逗号分隔）。只有被相近记忆拦下来、并确认要单独开一条时才填——插件会核对这几条本轮是否真读过。',
-    },
-    new_reason: {
-      type: 'string',
-      description: '可选：一句话说清为什么不能并进已有的相近记忆（对象/场景的差别）。和 checked 一起用。',
+        '必填：查重结论。先按索引里的名称和关键词自己判断一遍有没有相似/相同/相关的记忆；拿不准就用 memory_read 打开那几条读全文再看。' +
+        '然后写清「比了哪些、判成相似/相同/相关/无关、所以新建还是并入」，例如：跟 noahs-ark 都涉及删目录，读了全文发现它的对象是家目录、这条是 mklink 目录，确定为新建。' +
+        '提到名字就必须真读过（memory_read 才算），插件会核对。相似 → 改原文；相关 → memory_update + append:true；相同 → 别建。',
     },
   },
   required: ['name', 'keywords', 'description', 'body'],
@@ -1034,6 +971,11 @@ const REMEMBER_TOOL = {
           'Markdown 正文，通常 2000 字以内足够，写清楚比写短更重要。分条写：工作剖面（在哪、干什么）、项目目标、产物情况、待办清单、风险点。',
       },
       type: { type: 'string', description: '可选，一般省略，默认 reference。' },
+      dup_check: {
+        type: 'string',
+        description:
+          '查重结论：先扫索引里的名称和关键词，判断跟已有记忆是相似/相同/相关/无关；拿不准就 memory_read 打开读全文。写清「比了哪些、判成什么、所以新建还是并入」，提到名字就必须真读过。',
+      },
     },
     required: ['name', 'keywords', 'description', 'body'],
     additionalProperties: false,
@@ -1051,7 +993,8 @@ const REMEMBER_INSTRUCTION = [
   '2. keywords：第一个词固定写「项目记忆」，第二个词是项目名，后面最多 3 个词写这个项目里最可能再次遇到的场景/任务；',
   '3. 关键词要写完整、泛化的词或短语（如「说明书/alarm插件/闹钟使用」），不要拆成「钟」「时针」「铃声」「定时」这种碎片字词——目的不是检索精度，而是让以后需要它的 agent 一定能想起这条记忆；',
   '4. body：Markdown 正文，2000 字以内通常够用，写清楚比写短更重要；分条写工作剖面（在哪、干什么）、项目目标、产物情况、待办清单、风险点；',
-  '5. description：一句话说清以后什么时候该读它。',
+  '5. description：一句话说清以后什么时候该读它；',
+  '6. dup_check：一句话写查重结论——先扫索引里的名称和关键词，判成相似/相同/相关/无关，然后说明为什么新建（相似就改原文、相关就 append 并进去、相同就别建）；只比了关键词就照实写「只比关键词」。',
 ].join('\n');
 
 const REMEMBER_RETRY_INSTRUCTION = [
@@ -2075,8 +2018,8 @@ export function apply(ctx) {
             if (vagueProblem) throw new Error(vagueProblem);
             if (!description) throw new Error('description 不能为空，一句话说清什么时候读');
             if (!body) throw new Error('body 不能为空');
-            // 查重闸门：先想清楚「相似/相同/相关」，再决定新建还是并进已有条目。
-            const dupe = assertNoDupe(args, name, keywords);
+            // 查重闸门：模型自己比关键词、必要时读全文，然后把结论写进 dup_check。
+            const dupe = assertDupeReviewed(args);
             const attrs = [`name: ${name}`, `description: ${description}`, `type: ${type}`, `reviewed: ${today()}`];
             const target = path.join(MEM, file);
             fs.writeFileSync(target, joinDoc(attrs, body), 'utf8');
@@ -2094,8 +2037,8 @@ export function apply(ctx) {
             return {
               text:
                 `已记下：${file}\n关键词：${keywords}${lengthNote(file, body)}` +
-                (dupe.top.length && dupe.level === 'none'
-                  ? `\n（跟 ${dupe.top.map((r) => r.file).join('、')} 有轻微相似但已放行；下次相关的内容记得并进已有条目。）`
+                (dupe.named.length
+                  ? `\n（查重结论：${dupe.line}）`
                   : ''),
             };
           },
