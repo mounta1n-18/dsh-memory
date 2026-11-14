@@ -971,11 +971,6 @@ const REMEMBER_TOOL = {
           'Markdown 正文，通常 2000 字以内足够，写清楚比写短更重要。分条写：工作剖面（在哪、干什么）、项目目标、产物情况、待办清单、风险点。',
       },
       type: { type: 'string', description: '可选，一般省略，默认 reference。' },
-      dup_check: {
-        type: 'string',
-        description:
-          '查重结论：先扫索引里的名称和关键词，判断跟已有记忆是相似/相同/相关/无关；拿不准就 memory_read 打开读全文。写清「比了哪些、判成什么、所以新建还是并入」，提到名字就必须真读过。',
-      },
     },
     required: ['name', 'keywords', 'description', 'body'],
     additionalProperties: false,
@@ -994,7 +989,7 @@ const REMEMBER_INSTRUCTION = [
   '3. 关键词要写完整、泛化的词或短语（如「说明书/alarm插件/闹钟使用」），不要拆成「钟」「时针」「铃声」「定时」这种碎片字词——目的不是检索精度，而是让以后需要它的 agent 一定能想起这条记忆；',
   '4. body：Markdown 正文，2000 字以内通常够用，写清楚比写短更重要；分条写工作剖面（在哪、干什么）、项目目标、产物情况、待办清单、风险点；',
   '5. description：一句话说清以后什么时候该读它；',
-  '6. dup_check：一句话写查重结论——先扫索引里的名称和关键词，判成相似/相同/相关/无关，然后说明为什么新建（相似就改原文、相关就 append 并进去、相同就别建）；只比了关键词就照实写「只比关键词」。',
+  '6. 项目记忆是一条会话总结，跟已有条目撞车时没有合并通道，所以 keywords 和 description 要能跟相近的条目区分开：先扫一眼索引，若已有近似条目，把项目名和场景写得更具体，别写出两条让人分不清的项目记忆。',
 ].join('\n');
 
 const REMEMBER_RETRY_INSTRUCTION = [
