@@ -575,6 +575,23 @@ eq('不存在的详情报 404', missingCall.code, 404);
 const callsAll = await call(state, '/dsh-memory/calls');
 eq('不带会话时回全部', callsAll.body.calls.length, 3);
 
+// 一次读多条：早先整串当文件名 → readMemoryBody 抛异常被吞，整条读法在视图里不留痕。
+await runPost('memory_read', { file: 'pl-btw、noahs-ark' }, 'sess-c');
+const callsC = await call(state, '/dsh-memory/calls?sessionId=sess-c');
+eq('一次读多条记成多条流水', callsC.body.calls.length, 2);
+ok('批量读的两条都带各自目标', JSON.stringify(callsC.body.calls.map((c) => c.target).sort()) === JSON.stringify(['noahs-ark', 'pl-btw']), JSON.stringify(callsC.body.calls.map((c) => c.target)));
+ok('批量读的两条各自带正文', callsC.body.calls.every((c) => typeof c.chars === 'number' && c.chars > 20), JSON.stringify(callsC.body.calls.map((c) => c.chars)));
+ok('批量读的 id 互不相同', new Set(callsC.body.calls.map((c) => c.id)).size === 2, JSON.stringify(callsC.body.calls.map((c) => c.id)));
+const detailOne = await call(state, `/dsh-memory/call?id=${encodeURIComponent(callsC.body.calls[0].id)}`);
+ok('批量读的每条详情都取得到正文', /【记忆：/.test(detailOne.body.call.content || ''), JSON.stringify(detailOne.body.call?.chars));
+
+// 会话 id 有 `session-xxx` 与裸 `xxx` 两种形态，视图不能因为前缀不同就一条都不显示。
+await runPost('memory_read', { file: 'pl-mem' }, 'session-zzz-prefix');
+const callsPrefixed = await call(state, '/dsh-memory/calls?sessionId=zzz-prefix');
+eq('会话 id 前缀不同也能对上', callsPrefixed.body.calls.length, 1);
+const callsBare = await call(state, '/dsh-memory/calls?sessionId=session-zzz-prefix');
+eq('反方向也对得上', callsBare.body.calls.length, 1);
+
 console.log('\n[7] 设置页新建 / 删除');
 const mdCountBefore = fs.readdirSync(MEM).filter((f) => f.endsWith('.md')).length;
 r = await call(state, '/dsh-memory/create', {

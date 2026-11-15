@@ -1027,36 +1027,61 @@ const DELETED_BODIES = new Map();
 /**
  * 工具执行完记一笔：会话、轮、操作、目标、关键词、类型，以及**真正进出的完整内容**
  * （读=注入给模型的那段；写/改=写进文件的正文；删=删掉前的正文）。
+ *
+ * 一次读多条（`file:"a、b、c"`）时必须拆成多条流水：早先拿整串当文件名，
+ * `readMemoryBody("a、b.md")` 抛异常，被外层 catch 吞掉，于是这种读法在「记忆」视图里
+ * 完全不留痕（2026-11-15 的现场：会话 ba659a96 读了两次记忆，页面写「暂无记忆调用」）。
  */
 function recordMemoryCall(exec) {
   try {
     const args = exec?.arguments || {};
     const op = String(exec.name || '').replace(/^memory_/, '');
-    const raw = String(args.file || args.name || '').trim();
-    const target = raw.replace(/\.md$/i, '');
-    if (!target) return;
-    const file = `${target}.md`;
-    const entry = readEntries().find((e) => e.file === file);
-    const gone = op === 'delete' ? DELETED_BODIES.get(exec?.callId) : null;
-    let content = '';
-    if (op === 'read') content = `【记忆：${target}】\n\n${readMemoryBody(file) || ''}`;
-    else if (op === 'write') content = String(args.body || '').trim();
-    else if (op === 'update') content = readMemoryBody(file) || '';
-    else if (op === 'delete') content = gone?.body || '';
-    appendCall({
-      id: exec?.callId || '',
-      callId: exec?.callId || '',
-      sessionId: exec?.agent?.session?.id || '',
-      op,
-      target,
-      keywords: entry?.keywords || gone?.keywords || '',
-      type: entry?.type || gone?.type || '',
-      cat: String(entry?.keywords || gone?.keywords || '').split('/')[0].trim(),
-      chars: Array.from(content).length,
-      content,
-      ok: true,
+    const raw = String(args.file ?? args.name ?? '').trim();
+    const callId = String(exec?.callId || '');
+    const sessionId = exec?.agent?.session?.id || '';
+    // 读可以一次传多条；写/改/删永远只有一个目标。
+    const queries = op === 'read' ? raw.split(/[、,;；\n]+/) : [raw];
+    const targets = [];
+    for (const q of queries) {
+      const name = String(q || '').trim().replace(/^教训\/|^资料\/|^说明书\/|^项目记忆\/|^其它\//, '');
+      const stem = name.replace(/\.md$/i, '');
+      if (!stem) continue;
+      const entry = op === 'read' ? resolveEntry(stem) : null;
+      const file = entry?.file || `${stem}.md`;
+      const key = file.replace(/\.md$/i, '');
+      if (targets.some((t) => t.file === file)) continue; // 两种叫法点到同一个文件只记一条
+      targets.push({ file, key, entry });
+    }
+    if (!targets.length) return;
+    // 同一批多条共用一个基础 id；没有 callId 时自己造一个，否则第二条会变成 `#2` 这种撞车 id。
+    const baseId = callId || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    targets.forEach(({ file, key, entry }, i) => {
+      const gone = op === 'delete' ? DELETED_BODIES.get(callId) : null;
+      let content = '';
+      try {
+        if (op === 'read') content = `【记忆：${key}】\n\n${readMemoryBody(file) || ''}`;
+        else if (op === 'write') content = String(args.body || '').trim();
+        else if (op === 'update') content = readMemoryBody(file) || '';
+        else if (op === 'delete') content = gone?.body || '';
+      } catch {
+        content = '';
+      }
+      const id = i === 0 ? baseId : `${baseId}#${i + 1}`;
+      appendCall({
+        id,
+        callId,
+        sessionId,
+        op,
+        target: key,
+        keywords: entry?.keywords || gone?.keywords || '',
+        type: entry?.type || gone?.type || '',
+        cat: String(entry?.keywords || gone?.keywords || '').split('/')[0].trim(),
+        chars: Array.from(content).length,
+        content,
+        ok: true,
+      });
     });
-    if (op === 'delete') DELETED_BODIES.delete(exec?.callId);
+    if (op === 'delete') DELETED_BODIES.delete(callId);
   } catch {
     /* 记录失败不影响工具本身 */
   }
@@ -2422,7 +2447,12 @@ export function apply(ctx) {
               const sessionId = url.searchParams.get('sessionId') || '';
               const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit')) || 60));
               const all = readJson(CALLS, []);
-              const rows = (Array.isArray(all) ? all : []).filter((e) => e && (!sessionId || e.sessionId === sessionId));
+              // 会话 id 有两种写法（`session-xxx` 与裸 uuid，宿主不同版本给的形态不同），
+              // 直接全等会让另一形态的记录在视图里凭空消失，所以比较前统一去掉前缀。
+              const norm = (s) => String(s || '').replace(/^session-/, '');
+              const rows = (Array.isArray(all) ? all : []).filter(
+                (e) => e && (!sessionId || norm(e.sessionId) === norm(sessionId)),
+              );
               // 时间正序：老的在上面、新的在下面，符合从上往下读的习惯。
               const calls = rows.slice(-limit).map(({ content, ...rest }) => rest);
               sendJson(res, 200, { calls, sessionId, total: rows.length });
