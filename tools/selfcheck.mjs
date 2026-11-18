@@ -268,7 +268,7 @@ console.log(`\n[1] 装载面  DSH_HOME=${HOME}`);
 eq('两段系统提示注入', state.sections.length, 2);
 ok('注入顺序 outline < tidy-status', state.sections[0].name === 'memory:outline' && state.sections[1].name === 'memory:tidy-status');
 eq('四个模型工具', [...state.tools.keys()].sort().join(','), 'memory_delete,memory_read,memory_update,memory_write');
-eq('十六条路由（含 /remember、保留、调用流水/详情与探针）', state.routes.size, 16);
+eq('十七条路由（含 /remember、保留、提示词检视、调用流水/详情与探针）', state.routes.size, 17);
 
 console.log('\n[2] 大纲不丢条目');
 const outline = state.sections[0].text();
@@ -1106,7 +1106,26 @@ console.log('\n[16] 新建前查重（模型自己判断）/ 并进已有条目 
   ok('读过全文后放行', /已记下/.test(allowed.text), allowed.text.slice(0, 60));
   ok('回执带上查重结论', /查重结论/.test(allowed.text), allowed.text.slice(0, 120));
 
-  // 只比关键词、不提任何名字 → 也算查过了，直接放行。
+  // 这一轮读过的记忆必须在 dup_check 里表态：读到了却另开一条，是最容易漏的浪费。
+  userTurn();
+  read.execute({ file: 'noahs-ark' });
+  threw = '';
+  try {
+    write.execute({ name: 'dup-g', keywords: '说明书/查重基准/自检', ...base, dup_check: '只比了关键词，跟已有条目无关，新建' });
+  } catch (err) {
+    threw = err.message;
+  }
+  ok('读过却没表态被拒', /却没提它/.test(threw), threw.slice(0, 80));
+  const namedRead = write.execute({
+    name: 'dup-h',
+    keywords: '说明书/查重基准/自检',
+    ...base,
+    dup_check: '跟 noahs-ark 无关（它是删家目录，这条是自检夹具），判为无关，新建',
+  });
+  ok('表态后放行', /已记下/.test(namedRead.text), namedRead.text.slice(0, 60));
+
+  // 只比关键词、不提任何名字 → 也算查过了，直接放行（这一轮没读过任何正文）。
+  userTurn();
   const kwOnly = write.execute({ name: 'dup-f', keywords: '资料/另一种咖啡/自检', ...base, dup_check: '只比了关键词：没有涉及咖啡或冲泡的条目，判为无关，新建' });
   ok('只比关键词也能放行', /已记下/.test(kwOnly.text), kwOnly.text.slice(0, 60));
 
@@ -1125,15 +1144,31 @@ console.log('\n[16] 新建前查重（模型自己判断）/ 并进已有条目 
   const merged = fs.readFileSync(path.join(MEM, 'dup-e.md'), 'utf8');
   ok('追加没覆盖原正文', merged.includes('正文') && merged.includes('追加的一段'));
 
-  // 淘汰线随条目数收紧：条目越多，窗口天数越小、最低回忆次数越大。
+  // 淘汰线随条目数收紧：条目越多，窗口天数越小、最低回忆次数越大；再按当前口径缩放。
   const snap = await call(state, '/dsh-memory/status');
   const pr = snap.body.prune;
   ok('状态里带淘汰线', Boolean(pr) && typeof pr.days === 'number' && typeof pr.minHits === 'number', JSON.stringify(pr));
-  const daysOf = (n) => Math.max(10, Math.min(45, Math.round(45 / (1 + Math.log2(Math.max(1, n / 8))))));
-  const hitsOf = (n) => Math.max(1, 1 + Math.round(Math.log2(Math.max(1, n / 8))));
-  eq('淘汰天数按条目数算出来', pr.days, daysOf(pr.total));
-  eq('最低回忆次数按条目数算出来', pr.minHits, hitsOf(pr.total));
-  ok('条目多于 8 条时已经收紧（天数 < 45）', pr.total <= 8 || pr.days < 45, JSON.stringify(pr));
+  ok('状态里带口径档位', Number.isInteger(pr.tier) && pr.tier >= 1 && pr.tier <= 6, JSON.stringify(pr));
+  const SCALE = [1.5, 1.25, 1, 0.85, 0.7, 0.6];
+  const ADD = [0, 0, 0, 1, 1, 2];
+  const daysOf = (n, tier) =>
+    Math.max(7, Math.min(60, Math.round((45 / (1 + Math.log2(Math.max(1, n / 8)))) * SCALE[tier - 1])));
+  const hitsOf = (n, tier) => Math.max(1, 1 + Math.round(Math.log2(Math.max(1, n / 8))) + ADD[tier - 1]);
+  eq('淘汰天数按条目数与口径算出来', pr.days, daysOf(pr.total, pr.tier));
+  eq('最低回忆次数按条目数与口径算出来', pr.minHits, hitsOf(pr.total, pr.tier));
+  ok('淘汰窗口落在 7~60 天', pr.days >= 7 && pr.days <= 60, String(pr.days));
+
+  // 提示词检视：/dsh-memory/prompts 要把模型能看到的东西都交出来（记忆正文除外）。
+  const inv = await call(state, '/dsh-memory/prompts');
+  const ids = (inv.body?.items || []).map((it) => it.id);
+  ok('提示词接口可用', inv.code === 200 && ids.length >= 8, `${inv.code} / ${ids.length} 段`);
+  ok('含大纲抬头与工具定义', ids.includes('系统提示词·大纲抬头') && ids.includes('工具·memory_read') && ids.includes('工具·memory_write'), ids.join(' | ').slice(0, 120));
+  ok('含拦截与提醒原文', ids.includes('拦截·破坏性命令') && ids.includes('工具·动手前提醒'), ids.join(' | ').slice(0, 120));
+  const wt = (inv.body?.items || []).find((it) => it.id === '工具·memory_write');
+  ok('工具定义里带参数说明', /参数：/.test(wt?.text || '') && /dup_check/.test(wt?.text || ''), String(wt?.text || '').slice(0, 60));
+  ok('口径总字数可统计', Number.isFinite(inv.body?.totalChars) && inv.body.totalChars > 1000, String(inv.body?.totalChars));
+  const outlineNow = (inv.body?.items || []).find((it) => it.id === '系统提示词·大纲抬头')?.text || '';
+  ok('大纲里有当前口径那一句', /记的时候大方点|新主题优先|先看看现成的|优先改写|少一条胜过|记忆已经很挤/.test(outlineNow), outlineNow.slice(0, 80));
 
   // 破坏性命令的硬闸门：这一轮没读教训就拒一次，读过之后放行。
   userTurn();
@@ -1144,8 +1179,30 @@ console.log('\n[16] 新建前查重（模型自己判断）/ 并进已有条目 
   eq('读过教训后破坏性命令放行', await gate(state, 'pwsh', { command: 'Remove-Item -Recurse -Force C:\\tmp\\foo' }), 'pass');
 }
 
-console.log(`\n结果：${pass} 通过，${fails.length} 失败`);
-if (fails.length) {
+// 需要一份「模型能看到的全部提示词」时：DUMP_PROMPTS=<文件.md> node tools/selfcheck.mjs
+if (process.env.DUMP_PROMPTS) {
+  const inv = await call(state, '/dsh-memory/prompts');
+  const lines = [
+    '# 记忆插件：模型能看到的全部提示词',
+    '',
+    `> 自动生成，别手改：\`$env:DUMP_PROMPTS="<文件>" ; node tools/selfcheck.mjs\``,
+    `> 当次口径：第 ${inv.body.tier} 套 / 条目 ${inv.body.total} 条 / 目标 ${inv.body.target} 条。`,
+    '',
+    `全部原文合计 **${inv.body.totalChars}** 字。记忆正文不在其中（那是数据，不是提示词）。`,
+    '',
+    '## 每次请求都发的部分',
+    '',
+  ];
+  const always = ['系统提示词·大纲抬头', '系统提示词·大纲分组', '工具·memory_read', '工具·memory_write', '工具·memory_update', '工具·memory_delete'];
+  const once = inv.body.items.filter((it) => always.includes(it.id));
+  lines.push(`这 ${once.length} 段合计 **${once.reduce((n, it) => n + it.chars, 0)}** 字。`, '');
+  for (const it of inv.body.items) {
+    lines.push(`### ${it.id}（${it.chars} 字）`, '', `触发时机：${it.where}`, '', '```text', String(it.text || ''), '```', '');
+  }
+  fs.writeFileSync(process.env.DUMP_PROMPTS, lines.join('\n'), 'utf8');
+  console.log(`提示词清单已写到 ${process.env.DUMP_PROMPTS}`);
+}
+console.log(`\n结果：${pass} 通过，${fails.length} 失败`);if (fails.length) {
   console.log('失败项：');
   for (const f of fails) console.log(`  - ${f}`);
   process.exitCode = 1;

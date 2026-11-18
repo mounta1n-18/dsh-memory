@@ -1,4 +1,4 @@
-# dsh-memory
+﻿# dsh-memory
 
 一个 **DeepSeek Harness** 插件：把「跨对话的记忆」做成一摞本地 Markdown + 一张索引表，再配上一套管理界面。
 零依赖、无构建，纯手写 JavaScript（Host 半 + Client 半）。
@@ -64,7 +64,7 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
 - `memory:outline`（order 9890）：按分类分组的多行索引，取自 `MEMORY.md`，停用条目不出现。开头两行是**场景钩子说明**（2026-11-13 改短）：关键词写的是「什么场景下必须点开这条」；动手改 / 删 / 装 / 跑命令之前先扫【教训】，提到旧事或接手旧任务扫对应分组，拿不准就查（查错一次调用，漏查要返工）。其后每行一组：`【教训】…`、`【资料】…`、`【说明书】…`、`【项目记忆】…`；组名已表明分类，关键词里省掉重复的前缀。教训组永远排第一。
   单条关键词超过 42 字时在 `/` 边界裁剪并加 `…`（预算扣掉分类前缀）；**不做整行截断**，任何一条记忆都不会从大纲里消失（旧的 240 字整行截断实测丢过 `huashu-motion-install`）。
   只要存在启用的教训，末尾追加一句前置检查：「【教训】的钩子写的是「会闯祸的场面」：命中就先 memory_read 读完，再动手。」
-  静态成本约 1.2K token/请求（大纲 + 四个工具声明），不随记忆条数线性涨（单条关键词有裁剪上限）。
+  静态成本约 2.2K token/请求（大纲三段 + 四个工具声明 = 3197 字，见 `PROMPTS.md`），不随记忆条数线性涨（单条关键词有裁剪上限）。
 - `memory:tidy-status`（order 9900）：正常时零输出，异常才一行「待审批 N 份 / 上次失败：原因」。
 
 **动手前提醒（2026-11-14 新增）**：光靠索引常驻不够——模型动手那一刻经常不回头看大纲。所以 `tools/post-execute` 里盯着本轮**第一次** `write / edit / pwsh / computer_use / memory_delete / memory_update`，在工具结果后面追加一段 text block：`【教训提醒】动手前扫一眼…：noahs-ark=删家目录/重装DSH · …`（`lessonHooksLine()`，最多 8 条）。同一轮只提醒一次（`lastRemindTurn`），该轮已经用 `memory_read` 读过任何教训就闭嘴（`lessonReadThisTurn()` 查 `recall.json` 当前轮）。这是**场景触发**：成本约 100 token/轮且只在真要动手时出现。
@@ -77,6 +77,23 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
 2. **必须说真话**：结论里提到的任何条目名，都必须在这一轮真被 `memory_read` 读过（`readThisTurn()` 对 `recall.json`），否则拒——凭空报名字过不了。
 
 所以闸门同时是回忆的硬流程：想单开就得先翻出可能重复的那几条。判成相似就改原文、相关就 `memory_update` + `append:true` 并进去、相同就别建。另有 `keywordTooVague()`：整条关键词都是 `插件/记忆/工具/说明/回忆` 这类空泛词直接拒。
+
+**记忆总量管控（2026-11-18 新增，对模型黑箱）**：被控量是记忆条目总数，目标 `MEM_TARGET = 50`（10 条以下寥寥无几，100 条以上太多）。每个用户轮按 PID 算一个连续量 `u ∈ [-1,1]`：`err = (50 - 总数)/50`（正 = 太少），`u = Kp·err + ∫Ki·err·dt + Kd·d(err)/dt`，`Kp = 0.8`（小一点，避免一次波动就把口径甩档）、`Ki = 0.05`（积分限幅 ±0.6 抗饱和）、`Kd = 1.5`（大一点，合并/批量删这类骤变立刻反应）。同一轮内重复读快照只回上次的 `u`（面板每 3 秒轮询，不能让读一次就推进积分）。
+
+`u` 映射成六套口径（`tierOf()`：`u=+1` → 第 1 套，`u=-1` → 第 6 套），每套只是一句话，模型看到的是正常提示，看不到「档位 / 计数 / PID」这些机制：
+
+| 套 | 口径 | 淘汰窗口倍数 | 回忆门槛加码 |
+|---|---|---|---|
+| 1 | 记忆还少，新主题直接开一条 | ×1.5 | +0 |
+| 2 | 新主题优先单开，沾边别合并 | ×1.25 | +0 |
+| 3 | 先看现成的，能改旧条目就不开新 | ×1 | +0 |
+| 4 | 优先改写：旧条目在讲这件事就改它 | ×0.85 | +1 |
+| 5 | 少一条胜过多一条，沾边的并进去 | ×0.7 | +1 |
+| 6 | 记忆已经很挤：一律改写或并入，能删就删 | ×0.6 | +2 |
+
+当前套数写进 `.tidy/pid.json`，其那句话作为大纲第 3 行每轮下发；`pruneDays()` / `pruneMinHits()` 再按套数缩放（窗口夹在 7~60 天），所以「该记的时候记得住、该收的时候收得动」是同一套量在驱动。
+
+**提示词检视（`/dsh-memory/prompts`）**：把模型在整个记忆流程里能看到的提示词原文一次交出来——大纲、四个工具声明（注册时由 `toolSink` 顺手抄录，不手抄、不漂移）、动手前提醒、两道拦截的拒绝理由、各校验器的报错原文、`/remember` 的隐藏指令。`PROMPTS.md` 是它的落地版：`$env:DUMP_PROMPTS="PROMPTS.md"; node tools/selfcheck.mjs` 重新生成。
 
 **关键词口径（2026-11-13 再修订）**：关键词是**钩子**，不是摘要，也**不是句子**——写「**什么场景下必须点开这条**」，要具体、要勾人，像标题党一样让人在需要时非点不可；但要短：**每段 ≤10 字、1~4 段**（含分类），砍成名词 / 动词词组，别写「……前看」「……怎么用」这种尾巴。空泛词（`插件`、`记忆`、`工具`、`说明`、`回忆`）等于没写。
 - 资料 → 认得出来的对象（`中文乱码/代码页/BOM`、`称呼/基本信息`）；
@@ -104,7 +121,7 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
 
 `tools/post-execute` 对写进 `body` 的文件做 2000 字软提示：只提示，写入已生效；措辞刻意放轻，说重了模型会为缩字数丢信息。
 
-**十四条路由**：`GET /dsh-memory/status`（兼 `?client=1` 心跳）、`GET /dsh-memory/calls`（按会话列记忆调用）与 `POST keyword / open / approve-file / reject-file / toggle / protect / create / delete / search / compress / remember / dockping`。
+**十七条路由**：`GET /dsh-memory/status`（兼 `?client=1` 心跳）、`GET /dsh-memory/calls`（按会话列记忆调用）、`GET /dsh-memory/prompts`（提示词检视）与 `POST keyword / open / approve-file / reject-file / toggle / protect / keep / create / delete / search / compress / remember / dockping`。
 
 **记忆调用流水**：`tools/post-execute` 里记下每次 `memory_*` 调用（会话 id、轮、读/写/改/删、目标、关键词、字数，最多 400 条）到 `.tidy/calls.json`，供对话界面的「记忆」标签页显示；不进上下文、不写会话历史。
 
@@ -158,7 +175,7 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
 
 ## 工具（`tools/`）
 
-- `selfcheck.mjs`：mock 一个 cordis ctx 把 `apply()` 整条路径跑起来（临时 `DSH_HOME`，不碰真实记忆库），覆盖装载面、大纲、闸门、status、分类约束、回忆统计、新建/删除、搜索、压缩、/remember、调用流水、保留与动手前提醒、查重（模型自己判断）/并条目/空泛词/淘汰线/破坏性命令闸门共 225 项。**改完先跑它，再考虑重启**：`node tools/selfcheck.mjs`。
+- `selfcheck.mjs`：mock 一个 cordis ctx 把 `apply()` 整条路径跑起来（临时 `DSH_HOME`，不碰真实记忆库），覆盖装载面、大纲、闸门、status、分类约束、回忆统计、新建/删除、搜索、压缩、/remember、调用流水、保留与动手前提醒、查重（模型自己判断）/并条目/空泛词/淘汰线/破坏性命令闸门、总量口径与提示词检视共 241 项。**改完先跑它，再考虑重启**：`node tools/selfcheck.mjs`。
 - `tidy.mjs` + `run.cmd`：旧的「整理」worker，**已不再挂计划任务**（压缩不是定时任务）。保留作手动兜底：`node tools/tidy.mjs [--dry-run|--if-due]`，只写 `proposed/` 与 `status.json`。
 
 ## 未完成

@@ -34,17 +34,81 @@ const PRUNE_DAYS_MAX = 45; // 条目很少时给足观察期
 const PRUNE_DAYS_MIN = 10; // 条目很多时收紧到 10 天
 const PRUNE_BASE = 8; // 8 条以内：被读过 1 次就算活
 
-/** N 条时的淘汰窗口（天）：45 → 10，随条目数按 log2 递减。 */
-function pruneDays(total) {
-  const n = Math.max(1, Number(total) || 1);
-  const days = PRUNE_DAYS_MAX / (1 + Math.log2(Math.max(1, n / PRUNE_BASE)));
-  return Math.max(PRUNE_DAYS_MIN, Math.min(PRUNE_DAYS_MAX, Math.round(days)));
+/**
+ * 记忆总量管控（2026-11-18 用户口径）：被控量 = 记忆条目总数，目标 50 条。
+ * PID 输出 u ∈ [-1,1]（正 = 太少、该放开来记；负 = 太多、该收），映射成六套口径之一。
+ * 对模型是黑箱：它只看到措辞不同的一句话，看不到计数、档位、PID。
+ */
+const MEM_TARGET = 50; // 理想总量：10 条以下寥寥无几，100 条以上太多
+const PID_KP = 0.8; // 小一点：别让一次波动就把口径甩到另一档
+const PID_KI = 0.05; // 慢速累积，纠长期偏差
+const PID_KD = 1.5; // 大一点：条目数骤变（合并/批量删）时立刻反应
+const PID_INTEGRAL_MAX = 0.6; // 抗积分饱和
+const PID_FILE = path.join(TIDY, 'pid.json'); // {turn, integral, prevErr, u, tier, total}
+
+function clampNum(x, lo, hi) {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return lo;
+  return Math.max(lo, Math.min(hi, n));
 }
 
-/** N 条时「不算白记」的最低回忆次数：8 条以内 1 次，之后每翻一倍加 1，逼着条目争取被读。 */
-function pruneMinHits(total) {
+/** u → 1..6：u=+1 最宽松（第 1 套），u=0 偏中（第 4 套），u=-1 最严格（第 6 套）。 */
+function tierOf(u) {
+  return clampNum(Math.round(3.5 - 2.5 * (Number(u) || 0)), 1, 6);
+}
+
+/** 六套口径：模型只看到其中一句，看不到这是档位。1 = 最鼓励新建，6 = 最鼓励合并/删除。 */
+const TIER_LINES = [
+  '记的时候大方点：碰到新主题直接开一条，别硬塞进旧条目里。',
+  '新主题优先开一条；跟旧条目只是沾边，就别合并。',
+  '先看看现成的：能靠改一条旧记忆说清楚，就别开新条目。',
+  '优先改写：读到的旧条目已经在讲这件事，就改它，别开新的。',
+  '少一条胜过多一条：同一件事只留一条，沾边的并进去。',
+  '记忆已经很挤：除非旧条目完全不沾边，一律改写或并入，能删就删。',
+];
+const TIER_PRUNE_SCALE = [1.5, 1.25, 1, 0.85, 0.7, 0.6]; // 淘汰窗口（天）倍数：越严格越短
+const TIER_HITS_ADD = [0, 0, 0, 1, 1, 2]; // 淘汰所需回忆次数加码
+
+/**
+ * 读 PID 状态；同一轮内重复调用直接返回上次的 u（面板每 3 秒轮询一次 snapshot，
+ * 不能让一次读取就推进积分项）。只有跨轮才更新、才落盘。
+ */
+function pidState(total) {
+  const n = Math.max(0, Number(total) || 0);
+  const err = (MEM_TARGET - n) / MEM_TARGET; // 正 = 太少
+  const st = readJson(PID_FILE, null);
+  const integralPrev = Number.isFinite(st?.integral) ? st.integral : 0;
+  const prevErr = Number.isFinite(st?.prevErr) ? st.prevErr : err;
+  const uPrev = Number.isFinite(st?.u) ? st.u : clampNum(PID_KP * err, -1, 1);
+  const lastTurn = Number.isFinite(st?.turn) ? st.turn : null;
+  if (lastTurn !== null && turnCount <= lastTurn) return { u: uPrev, tier: tierOf(uPrev), err };
+  const dt = lastTurn === null ? 1 : Math.max(1, turnCount - lastTurn);
+  const integral = clampNum(integralPrev + PID_KI * err * dt, -PID_INTEGRAL_MAX, PID_INTEGRAL_MAX);
+  const derivative = (err - prevErr) / dt;
+  const u = clampNum(PID_KP * err + integral + PID_KD * derivative, -1, 1);
+  const tier = tierOf(u);
+  writeJson(PID_FILE, { turn: turnCount, integral, prevErr: err, u, tier, total: n });
+  return { u, tier, err };
+}
+
+/** 当前该用第几套口径。 */
+function currentTier(total = readEntries().length) {
+  return pidState(total).tier;
+}
+
+/** N 条时的淘汰窗口（天）：45 → 10，随条目数按 log2 递减，再按当前口径缩放。 */
+function pruneDays(total, tier = currentTier(total)) {
   const n = Math.max(1, Number(total) || 1);
-  return Math.max(1, 1 + Math.round(Math.log2(Math.max(1, n / PRUNE_BASE))));
+  const days = PRUNE_DAYS_MAX / (1 + Math.log2(Math.max(1, n / PRUNE_BASE)));
+  const scale = TIER_PRUNE_SCALE[clampNum(tier, 1, 6) - 1];
+  return Math.max(7, Math.min(60, Math.round(days * scale)));
+}
+
+/** N 条时「不算白记」的最低回忆次数：8 条以内 1 次，之后每翻一倍加 1，再按口径加码。 */
+function pruneMinHits(total, tier = currentTier(total)) {
+  const n = Math.max(1, Number(total) || 1);
+  const base = 1 + Math.round(Math.log2(Math.max(1, n / PRUNE_BASE)));
+  return Math.max(1, base + TIER_HITS_ADD[clampNum(tier, 1, 6) - 1]);
 }
 const COMPRESS = path.join(TIDY, 'compress.json'); // {startedAt, finishedAt, stage, reason, files, detail}
 const COMPRESS_STALE_MS = 15 * 60_000; // 有 startedAt 无 finishedAt 且超过这么久 → 判定上次中断
@@ -85,6 +149,7 @@ const REJECT_FILE_ROUTE = '/dsh-memory/reject-file';
 const TOGGLE_ROUTE = '/dsh-memory/toggle';
 const PROTECT_ROUTE = '/dsh-memory/protect';
 const KEEP_ROUTE = '/dsh-memory/keep';
+const PROMPTS_ROUTE = '/dsh-memory/prompts'; // 只读：把模型能看到的提示词原文全部交出来
 const CREATE_ROUTE = '/dsh-memory/create';
 const DELETE_ROUTE = '/dsh-memory/delete';
 const SEARCH_ROUTE = '/dsh-memory/search';
@@ -250,6 +315,12 @@ const REMIND_TOOLS = new Set(['write', 'edit', 'pwsh', 'computer_use', 'memory_d
 const DANGER_CMD =
   /\b(Remove-Item|rmdir|rd\s+\/s|del\s+\/[fsq]|rm\s+-[a-z]*r|git\s+(reset\s+--hard|clean\s+-[a-z]*f)|Stop-Process|taskkill|Format-Volume|Clear-Disk|reg\s+delete|Unregister-ScheduledTask|Remove-ItemProperty)\b/i;
 
+// 拦截话术集中在这里：既给 pre-execute 用，也给 /dsh-memory/prompts 抄录，改一处就够。
+const MEMORY_DIR_DENY_TEXT = '记忆正文要用 memory_read 工具读：先在大纲里挑名称或关键词，再调用它，不要直接翻仓库文件。';
+const MEMORY_DIR_GREP_DENY_TEXT = '不要搜索记忆仓库目录；改用 memory_read，按大纲里的名称或关键词取正文。';
+const DANGER_REASON_TEXT =
+  '这条命令是破坏性的，先看一眼教训再跑——这一轮你还没读任何【教训】：{hooks}。\n用 memory_read 读完相关的那条（可一次传多条），再原样重试这条命令。';
+
 function lessonEntries() {
   try {
     return readEntries().filter((e) => e.enabled && /^教训\//.test(e.keywords || ''));
@@ -412,6 +483,15 @@ function assertDupeReviewed(args) {
   if (unread.length) {
     throw new Error(
       `你在查重结论里提了 ${unread.join('、')}，但这一轮没读过它（memory_read 才算），别凭空报名字：先读，再回来写。`,
+    );
+  }
+  // 刚落笔前读过的记忆必须表态：读到了就绕开它另开一条，是最容易被忽略的浪费。
+  const readNow = [...readThisTurn(stems)].map((f) => f.replace(/\.md$/i, ''));
+  const ignored = readNow.filter((n) => !named.includes(n));
+  if (ignored.length) {
+    throw new Error(
+      `你这一轮读过 ${ignored.join('、')}，dup_check 里却没提它：先说清跟它是什么关系再落盘——` +
+        '相似就 memory_update 改它、相关就 append:true 并进去、无关就写明「无关」的理由。别读到了还另开一条。',
     );
   }
   return { line, named, read: named.length > 0 };
@@ -952,6 +1032,30 @@ const WRITE_TOOL_PARAMETERS = {
  * `/remember` 给主 agent 的工具声明：同一个 `memory_write` 工具，
  * 只把「关键词首词」和「内容取向」改成本次任务的口径。
  */
+
+/** 另外三个工具的说明也提到模块级：`/dsh-memory/prompts` 与注册共用同一份原文，改一处即可。 */
+const READ_TOOL_DESCRIPTION = [
+  '读取记忆正文。上下文里有一行「记忆 ▸ 名称=关键词」，先按关键词挑出和当前任务对得上的，再用本工具取原文。',
+  '可以一次读多条：file 用「、」或逗号分隔（如 "noahs-ark、审计日志"），比一条条读省调用、也更适合「动手前先把相关教训都扫一遍」。',
+  '「教训/」开头的条目是**动手前**必查的：只要它的动作场景落进你这次要做的事，先读它、再动手；不要等报了错才回来找。',
+  '不要用 read / grep / glob / 命令行去翻记忆仓库：插件会拒绝，而且那样更慢。',
+  'file 传大纲里的名称（如 user-profile），也可以传一个关键词（如 身份）。',
+].join(' ');
+
+const UPDATE_TOOL_DESCRIPTION = [
+  '发现某条记忆过时、有误或不全时，顺手订正它。只传要改的字段，其余保持原样。',
+  '新内容跟已有记忆相关（不是过时，而是同一件事又有了新经验）时，用 append:true 把这段并进正文尾部，而不是另开一条。',
+  '换关键词时第一段仍是分类：资料 / 教训 / 说明书 / 其它（项目记忆 只能由用户点「大脑」生成）。',
+  '关键词按「什么场景下必须点开这条」写，越短越勾人越好；空泛词（插件、记忆、工具）等于没写，也别写 422 / 报错 这类事后症状。',
+  '锁定的记忆会被拒绝，需要用户先在设置页解锁。',
+].join(' ');
+
+const DELETE_TOOL_DESCRIPTION = [
+  '删除一条确实没用了的记忆，同时删掉索引行。删除前确认没有别的记忆在引用它。',
+  '这是不可回滚的删除：正文文件直接删掉，只在记忆调用流水里留一份留底。',
+  '锁定的记忆会被拒绝，需要用户先在设置页解锁。',
+].join(' ');
+
 const REMEMBER_TOOL = {
   name: 'memory_write',
   description:
@@ -1006,8 +1110,76 @@ const REMEMBER_SYSTEM = [
   'description 一句话说清以后什么时候该读它。只调用工具，不要输出文字。',
 ].join('\n');
 
-/** 追加一条调用流水，只留最近 CALL_KEEP 条。 */
-function appendCall(row) {
+/**
+ * 模型在整个记忆流程里能看到的提示词原文（记忆正文除外）。
+ * 用户 2026-11-18 要求逐条过目，所以这里不裁剪、不摘要，连校验报错也照着触发一遍抄下来。
+ * 工具定义不是手抄的：注册时由 toolSink 顺手记下来，免得文档和实际漂移。
+ */
+const REGISTERED_PROMPTS = [];
+
+function recordToolDef(def) {
+  try {
+    const params = Object.entries(def?.parameters?.properties || {})
+      .map(([k, v]) => `  ${k}${Array.isArray(def?.parameters?.required) && def.parameters.required.includes(k) ? '（必填）' : ''}：${v?.description || ''}`)
+      .join('\n');
+    REGISTERED_PROMPTS.push({
+      id: `工具·${def?.name || '?'}`,
+      where: '工具定义（每次请求都随工具一起发出）',
+      text: `${def?.description || ''}${params ? `\n参数：\n${params}` : ''}`,
+    });
+  } catch {
+    /* 记录失败不影响注册 */
+  }
+}
+
+function promptInventory() {
+  const entries = readEntries();
+  const tier = currentTier(entries.length);
+  const tree = outlineText(entries).split('\n');
+  const items = [
+    { id: '系统提示词·大纲抬头', where: '系统提示词·记忆索引（每轮都在）', text: tree.slice(0, 3).join('\n') },
+    { id: '系统提示词·大纲分组', where: '系统提示词·记忆索引（每轮都在）', text: tree.slice(3).join('\n') },
+  ];
+  for (const it of REGISTERED_PROMPTS) items.push({ id: it.id, where: it.where, text: it.text });
+  items.push({ id: '工具·动手前提醒', where: '每轮第一次写/改/跑命令时追加', text: lessonReminder() });
+  items.push({ id: '拦截·破坏性命令', where: 'pwsh 命中危险命令且本轮还没读教训时', text: DANGER_REASON_TEXT });
+  items.push({ id: '拦截·翻记忆目录', where: 'read/grep/glob 指向记忆仓库时', text: MEMORY_DIR_DENY_TEXT });
+  items.push({ id: '校验·按需触发', where: '写入/改写被拒时的报错原文', text: validationTexts().join('\n\n') });
+  items.push({ id: '/remember·隐藏指令', where: '用户执行 /remember 时追加', text: `${REMEMBER_INSTRUCTION}\n\n---重试时---\n${REMEMBER_RETRY_INSTRUCTION}` });
+  items.push({ id: '/remember·兜底系统提示', where: 'llm 服务不可用时', text: REMEMBER_SYSTEM });
+  return {
+    tier,
+    total: entries.length,
+    target: MEM_TARGET,
+    items: items.map((it) => ({ ...it, chars: Array.from(String(it.text || '')).length })),
+    totalChars: items.reduce((n, it) => n + Array.from(String(it.text || '')).length, 0),
+  };
+}
+
+/** 把各校验器的报错原文触发一遍，供 promptInventory 抄录（只在 /dsh-memory/prompts 里跑）。 */
+function validationTexts() {
+  const out = [];
+  const run = (label, fn) => {
+    try {
+      const r = fn();
+      if (typeof r === 'string') out.push(`［${label}］${r}`);
+    } catch (err) {
+      out.push(`［${label}］${err.message}`);
+    }
+  };
+  run('分类不对', () => assertCategory('乱写/分类'));
+  run('名称非法', () => assertName('Bad Name.md'));
+  run('关键词太长', () => keywordTooLong('教训/批量删除家目录前一定要先看清路径'));
+  run('关键词段数太多', () => keywordTooLong('教训/一/二/三/四'));
+  run('关键词是事后症状', () => lessonKeywordProblem('教训/422/缺 role'));
+  run('关键词空泛', () => keywordTooVague('说明书/插件/工具'));
+  run('查重没写', () => assertDupeReviewed({}));
+  run('查重太短', () => assertDupeReviewed({ dup_check: '无关' }));
+  run('查重没判定词', () => assertDupeReviewed({ dup_check: '我觉得跟以前那些都不一样所以直接新建一条吧' }));
+  return out;
+}
+
+/** 追加一条调用流水，只留最近 CALL_KEEP 条。 */function appendCall(row) {
   try {
     const list = readJson(CALLS, []);
     const events = Array.isArray(list) ? list : [];
@@ -1681,6 +1853,8 @@ function outlineText(entries = readEntries()) {
   const lines = [
     '记忆索引（名称=关键词）。关键词是钩子，写的是「什么场景下必须点开这条」。读正文用 memory_read，可一次传多个（file:"a、b"）。',
     '动手改 / 删 / 装 / 跑命令之前，先扫【教训】；提到旧事或接手旧任务，扫对应分组；拿不准就查——查错一次调用，漏查要返工。',
+    // 总量口径：六套措辞由 PID 选出，模型只看到一句话，看不到机制。
+    TIER_LINES[currentTier(entries.length) - 1],
   ];
   for (const [cat] of OUTLINE_GROUPS) {
     const rows = live
@@ -1746,8 +1920,14 @@ function snapshot() {
   // 回忆率与「待删除」都是可推导的统计量，不进索引表：索引只存人写的事实。
   const rates = recallRates();
   const windowSize = Math.min(WINDOW_TURNS, turnCount);
-  // 条目越多淘汰越紧（对数）：这是让总量增长趋缓的执行端。
-  const prune = { total: entries.length, days: pruneDays(entries.length), minHits: pruneMinHits(entries.length) };
+  // 条目越多淘汰越紧（对数）；再叠加总量口径：越缺记忆越松、越挤越紧。
+  const tier = currentTier(entries.length);
+  const prune = {
+    total: entries.length,
+    days: pruneDays(entries.length, tier),
+    minHits: pruneMinHits(entries.length, tier),
+    tier,
+  };
   for (const e of entries) {
     const hits = rates.get(e.file);
     e.recallRate = windowSize ? hits || 0 : null;
@@ -1933,17 +2113,18 @@ export function apply(ctx) {
 
   // 记忆只通过插件工具交付：先看大纲关键词，再用 memory_read 取原文。
   ctx.inject(['tools'], (toolCtx) => {
+    // 注册的同时把工具声明抄一份给 /dsh-memory/prompts：用户要看提示词全貌，不能靠手抄。
+    const toolSink = {
+      register(def) {
+        recordToolDef(def);
+        return toolCtx.tools.register(def);
+      },
+    };
     toolCtx.effect(
       () =>
-        toolCtx.tools.register({
+        toolSink.register({
           name: 'memory_read',
-          description: [
-            '读取记忆正文。上下文里有一行「记忆 ▸ 名称=关键词」，先按关键词挑出和当前任务对得上的，再用本工具取原文。',
-            '可以一次读多条：file 用「、」或逗号分隔（如 "noahs-ark、审计日志"），比一条条读省调用、也更适合「动手前先把相关教训都扫一遍」。',
-            '「教训/」开头的条目是**动手前**必查的：只要它的动作场景落进你这次要做的事，先读它、再动手；不要等报了错才回来找。',
-            '不要用 read / grep / glob / 命令行去翻记忆仓库：插件会拒绝，而且那样更慢。',
-            'file 传大纲里的名称（如 user-profile），也可以传一个关键词（如 身份）。',
-          ].join(' '),
+          description: READ_TOOL_DESCRIPTION,
           parameters: {
             type: 'object',
             properties: {
@@ -2007,7 +2188,7 @@ export function apply(ctx) {
     // 一次调用写一条记忆：插件负责建文件、补索引、查重、报字数。
     toolCtx.effect(
       () =>
-        toolCtx.tools.register({
+        toolSink.register({
           name: 'memory_write',
           description: WRITE_TOOL_DESCRIPTION,
           parameters: WRITE_TOOL_PARAMETERS,
@@ -2069,15 +2250,9 @@ export function apply(ctx) {
     // 订正一条已有记忆；锁定的不许改。
     toolCtx.effect(
       () =>
-        toolCtx.tools.register({
+        toolSink.register({
           name: 'memory_update',
-          description: [
-            '发现某条记忆过时、有误或不全时，顺手订正它。只传要改的字段，其余保持原样。',
-            '新内容跟已有记忆相关（不是过时，而是同一件事又有了新经验）时，用 append:true 把这段并进正文尾部，而不是另开一条。',
-            '换关键词时第一段仍是分类：资料 / 教训 / 说明书 / 其它（项目记忆 只能由用户点「大脑」生成）。',
-            '关键词按「什么场景下必须点开这条」写，越短越勾人越好；空泛词（插件、记忆、工具）等于没写，也别写 422 / 报错 这类事后症状。',
-            '锁定的记忆会被拒绝，需要用户先在设置页解锁。',
-          ].join(' '),
+          description: UPDATE_TOOL_DESCRIPTION,
           parameters: {
             type: 'object',
             properties: {
@@ -2147,12 +2322,9 @@ export function apply(ctx) {
     // 删除一条记忆；锁定的不许删。
     toolCtx.effect(
       () =>
-        toolCtx.tools.register({
+        toolSink.register({
           name: 'memory_delete',
-          description: [
-            '删除一条确实没用了的记忆，同时删掉索引行。删除前确认没有别的记忆在引用它。',
-            '锁定的记忆会被拒绝，需要用户先在设置页解锁。',
-          ].join(' '),
+          description: DELETE_TOOL_DESCRIPTION,
           parameters: {
             type: 'object',
             properties: {
@@ -2203,26 +2375,17 @@ export function apply(ctx) {
         const raw = args.file_path || args.path;
         const kind = raw ? memoryKind(raw) : 'outside';
         if (exec.name === 'read' && kind === 'body') {
-          return {
-            kind: 'deny',
-            reason: '记忆正文要用 memory_read 工具读：先在大纲里挑名称或关键词，再调用它，不要直接翻仓库文件。',
-          };
+          return { kind: 'deny', reason: MEMORY_DIR_DENY_TEXT };
         }
         // grep / glob 搜仓库根或正文，等于批量跳过 memory_read。
         if ((exec.name === 'grep' || exec.name === 'glob') && (kind === 'root' || kind === 'body')) {
-          return {
-            kind: 'deny',
-            reason: '不要搜索记忆仓库目录；改用 memory_read，按大纲里的名称或关键词取正文。',
-          };
+          return { kind: 'deny', reason: MEMORY_DIR_GREP_DENY_TEXT };
         }
         // 破坏性命令：这一轮还没读教训就拦一次，先读再重试（硬限制，不只靠提醒）。
         if (exec.name === 'pwsh' && DANGER_CMD.test(String(args.command || '')) && !lessonReadThisTurn()) {
           const line = lessonHooksLine();
           if (line) {
-            return {
-              kind: 'deny',
-              reason: `这条命令是破坏性的，先看一眼教训再跑——这一轮你还没读任何【教训】：${line}。\n用 memory_read 读完相关的那条（可一次传多条），再原样重试这条命令。`,
-            };
+            return { kind: 'deny', reason: DANGER_REASON_TEXT.replace('{hooks}', line) };
           }
         }
         // 删除前留一份正文与元数据：删完文件就没了，详情里要显示真正被删掉的内容。
@@ -2392,6 +2555,17 @@ export function apply(ctx) {
               sendJson(res, 200, { ...snapshot(), kept });
             } catch (err) {
               sendJson(res, 400, { error: err.message });
+            }
+          },
+        }),
+        webCtx.webServer.register({
+          kind: 'exact',
+          path: PROMPTS_ROUTE,
+          handler: (req, res) => {
+            try {
+              sendJson(res, 200, promptInventory());
+            } catch (err) {
+              sendJson(res, 500, { error: err.message });
             }
           },
         }),
