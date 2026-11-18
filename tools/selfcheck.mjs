@@ -258,7 +258,9 @@ async function call(state, routePath, body) {
   return { code, body: out ? JSON.parse(out) : null };
 }
 
-const { apply } = await import(pathToFileURL(path.join(PKG, 'index.js')).href);
+const mod = await import(pathToFileURL(path.join(PKG, 'index.js')).href);
+const { apply } = mod;
+const T = mod.__test; // 压缩流水线的纯函数：预算、工具声明、回包解析
 
 const agent = { id: 'selfcheck-root' };
 const { ctx, state } = makeCtx(agent);
@@ -672,25 +674,37 @@ let compressCalls = 0;
 let sawThinking = null;
 let sawModel = null;
 let sawResponseFormat = null;
+let sawToolName = null;
+let sawToolEnum = null;
+let sawTokensBudget = null;
+let sawBudgetChars = null;
 globalThis.fetch = async (url, opts) => {
   compressCalls += 1;
   const request = JSON.parse(opts.body);
   sawThinking = request.thinking;
   sawModel = request.model;
   sawResponseFormat = request.response_format;
+  sawTokensBudget = request.max_tokens;
+  const tool = (request.tools || [])[0];
+  sawToolName = tool ? tool.function.name : null;
+  sawToolEnum = tool ? tool.function.parameters.properties.items.items.properties.file.enum : null;
   const memories = JSON.parse(request.messages[1].content).memories;
+  sawBudgetChars = memories.reduce((n, m) => n + Array.from(String(m.body || '')).length, 0);
   // 按档位造改稿：轻调整压到 85%，中删减压到 60%，都落在目标区间
   const factor = request.messages[0].content.includes('轻调整器') ? 0.85 : 0.6;
   const items = memories.map((m) => ({
     file: m.file,
     body: m.body.slice(0, Math.max(60, Math.floor(Array.from(m.body).length * factor))),
   }));
-  const content = JSON.stringify({ items });
+  // 主路径：工具调用填参；没有 tools 的请求（降级路径）才回 JSON 文本
+  const message = tool
+    ? { tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'submit_rewrites', arguments: JSON.stringify({ items }) } }] }
+    : { content: JSON.stringify({ items }) };
   return {
     ok: true,
     status: 200,
     async text() {
-      return JSON.stringify({ choices: [{ message: { content } }], usage: { prompt_tokens: 1, completion_tokens: 1 } });
+      return JSON.stringify({ choices: [{ message }], usage: { prompt_tokens: 1, completion_tokens: 1 } });
     },
   };
 };
@@ -708,7 +722,11 @@ const compressState = JSON.parse(fs.readFileSync(path.join(TIDY, 'compress.json'
 ok('压缩跑完并记账', Boolean(compressState.finishedAt), JSON.stringify(compressState));
 eq('压缩显式关掉思考', sawThinking && sawThinking.type, 'disabled');
 eq('模型用官方 ID deepseek-flash', sawModel, 'deepseek-flash');
-eq('用 json_object 保证回包是 JSON', sawResponseFormat && sawResponseFormat.type, 'json_object');
+eq('改稿走工具调用（不是散文 JSON）', sawToolName, 'submit_rewrites');
+ok('file 用 enum 锁死本批文件', Array.isArray(sawToolEnum) && sawToolEnum.length > 0 && sawToolEnum.every((f) => /\.md$/.test(f)), JSON.stringify(sawToolEnum));
+eq('输出预算按正文量算（1.6 倍 + 1024）', sawTokensBudget, T.compressMaxTokens(sawBudgetChars));
+ok('预算不低于 8192', sawTokensBudget >= 8192, String(sawTokensBudget));
+eq('主路径不吃降级（没有 response_format）', sawResponseFormat, undefined);
 ok('至少一组请求', compressCalls >= 1, `${compressCalls} 次`);
 eq('高频/锁定不送模型', compressState.files.includes('user-profile.md'), false);
 r = await call(state, '/dsh-memory/status');
@@ -827,10 +845,12 @@ globalThis.fetch = async (url, opts) => {
   }
   const memories = JSON.parse(req.messages[1].content).memories;
   const factor = req.messages[0].content.includes('轻调整器') ? 0.85 : 0.6;
-  const content = JSON.stringify({
-    items: memories.map((m) => ({ file: m.file, body: m.body.slice(0, Math.max(60, Math.floor(Array.from(m.body).length * factor))) })),
-  });
-  return { ok: true, status: 200, async text() { return JSON.stringify({ choices: [{ message: { content }, finish_reason: 'stop' }] }); } };
+  const items = memories.map((m) => ({ file: m.file, body: m.body.slice(0, Math.max(60, Math.floor(Array.from(m.body).length * factor))) }));
+  // 有 tools 就按工具调用回（主路径），没有才回 JSON 文本（降级路径）
+  const message = (req.tools || [])[0]
+    ? { tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'submit_rewrites', arguments: JSON.stringify({ items }) } }], finish_reason: 'tool_calls' }
+    : { content: JSON.stringify({ items }), finish_reason: 'stop' };
+  return { ok: true, status: 200, async text() { return JSON.stringify({ choices: [{ message }] }); } };
 };
 r = await call(state, '/dsh-memory/compress', {});
 for (let i = 0; i < 60; i += 1) {
@@ -842,7 +862,7 @@ for (let i = 0; i < 60; i += 1) {
 }
 ok('空正文回包会自动重跑', compAttempts >= 2, `${compAttempts} 次请求`);
 ok('每次请求都显式关掉思考（不传字段 ≠ 关闭）', thinkings.every((t) => t?.type === 'disabled'), JSON.stringify(thinkings));
-eq('每次请求都显式给足 max_tokens', sawMaxTokens, 8192);
+ok('每次请求都显式给足 max_tokens（不少于下限 8192）', sawMaxTokens >= T.COMPRESS_MAX_TOKENS, String(sawMaxTokens));
 ok('分批送，单批不超过 4 份', batchSizes.every((n) => n <= 4), batchSizes.join(','));
 ok('重跑后照样出方案', JSON.parse(fs.readFileSync(path.join(TIDY, 'compress.json'), 'utf8')).files.length > 0);
 for (const f of fs.readdirSync(PROPOSED)) fs.unlinkSync(path.join(PROPOSED, f));
@@ -1177,6 +1197,29 @@ console.log('\n[16] 新建前查重（模型自己判断）/ 并进已有条目 
   eq('普通命令不受影响', await gate(state, 'pwsh', { command: 'git status --short' }), 'pass');
   read.execute({ file: 'noahs-ark' });
   eq('读过教训后破坏性命令放行', await gate(state, 'pwsh', { command: 'Remove-Item -Recurse -Force C:\\tmp\\foo' }), 'pass');
+}
+
+console.log('\n[17] 压缩请求的结构化输出（工具调用 + 预算 + 回包解析）');
+{
+  // 预算：地板 8192、天花板 65536、中间按正文量线性放大（2026-11-18 截断事故的根因就是预算不够）
+  eq('空批次取下限', T.compressMaxTokens(0), T.COMPRESS_MAX_TOKENS);
+  ok('大批次预算随正文量放大', T.compressMaxTokens(8000) > T.COMPRESS_MAX_TOKENS, String(T.compressMaxTokens(8000)));
+  eq('超大批次封顶 65536', T.compressMaxTokens(1e6), T.COMPRESS_MAX_TOKENS_CAP);
+  // 工具声明：file 用 enum 锁死候选，多给文件名也写不出来
+  const spec = T.compressToolSpec(['a.md', 'b.md']);
+  eq('工具名固定', spec.function.name, 'submit_rewrites');
+  eq('file 的 enum 就是本批文件', JSON.stringify(spec.function.parameters.properties.items.items.properties.file.enum), JSON.stringify(['a.md', 'b.md']));
+  eq('items 必填且不许多余字段', JSON.stringify(spec.function.parameters.properties.items.items.required), JSON.stringify(['file', 'body']));
+  eq('整条参数不许多余字段', spec.function.parameters.additionalProperties, false);
+  // 回包解析：拿得到 tool_calls / 拿不到就空数组（由上层重试或降级）
+  const okPayload = { choices: [{ message: { tool_calls: [{ function: { name: 'submit_rewrites', arguments: JSON.stringify({ items: [{ file: 'a.md', body: 'x' }] }) } }] } }] };
+  eq('从 tool_calls 取到 items', JSON.stringify(T.toolCallItems(okPayload)), JSON.stringify([{ file: 'a.md', body: 'x' }]));
+  eq('没有工具调用返回空数组', JSON.stringify(T.toolCallItems({ choices: [{ message: { content: '{}' } }] })), '[]');
+  eq('别的工具名不算数', JSON.stringify(T.toolCallItems({ choices: [{ message: { tool_calls: [{ function: { name: 'other', arguments: '{"items":[]}' } }] } }] })), '[]');
+  eq('参数被截断（坏 JSON）返回空数组', JSON.stringify(T.toolCallItems({ choices: [{ message: { tool_calls: [{ function: { name: 'submit_rewrites', arguments: '{"items":[{"file":"a.md"' } }] } }] })), '[]');
+  eq('缺 file 的条目被丢掉', JSON.stringify(T.toolCallItems({ choices: [{ message: { tool_calls: [{ function: { name: 'submit_rewrites', arguments: JSON.stringify({ items: [{ body: 'x' }, { file: 'b.md', body: 'y' }] }) } }] } }] })), JSON.stringify([{ file: 'b.md', body: 'y' }]));
+  // 降级路径仍然可用：围栏里包着的 JSON 也能抠出来
+  eq('降级解析容忍代码围栏', JSON.stringify(T.parseCompressItems('```json\n{"items":[{"file":"a.md","body":"z"}]}\n```')), JSON.stringify([{ file: 'a.md', body: 'z' }]));
 }
 
 // 需要一份「模型能看到的全部提示词」时：DUMP_PROMPTS=<文件.md> node tools/selfcheck.mjs

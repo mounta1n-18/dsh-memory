@@ -121,7 +121,19 @@ const KEEP_HEAVY = 0.5; // 中删减：至少压到原文 50%
 const HEAVY_MAX = 0.7; // 中删减：最多留 70%
 const NOOP_RATIO = 0.97; // 缩减不到 3% 视为「几乎未动」，不提审
 const COMPRESS_BATCH = 4; // 每次请求最多送几份：送太多时思考会吃光输出预算，回包直接空
-const COMPRESS_MAX_TOKENS = 8192; // 官方上限；不显式给的话默认预算装不下几份改稿
+const COMPRESS_MAX_TOKENS = 8192; // 下限；不给足预算，几份改稿会写到一半被截断
+const COMPRESS_MAX_TOKENS_CAP = 65536; // 官方 max output 384K，这里留足余量
+const COMPRESS_TOKENS_PER_CHAR = 1.6; // 中文 1 字约 0.6 token，反向按 1.6 保守估，宁多不少
+
+/**
+ * 按本批正文总量算输出预算：改稿比原文短，1.6 倍 + 1024 足够。
+ * 2026-11-18 实测：一次 4 份的批次输出 7378 字，紧贴旧的 8192 上限，
+ * 截断后 JSON 只剩半截，报成「模型输出里没有 JSON 对象」——加满预算比加校验有用。
+ */
+function compressMaxTokens(chars) {
+  const budget = Math.round((Number(chars) || 0) * COMPRESS_TOKENS_PER_CHAR) + 1024;
+  return Math.min(COMPRESS_MAX_TOKENS_CAP, Math.max(COMPRESS_MAX_TOKENS, budget));
+}
 
 /** 压缩流水线的现场记录：每次模型调用的输入规模、输出字数、token 用量。 */
 function compressTrace(text) {
@@ -974,14 +986,14 @@ const COMPRESS_LIGHT_SYSTEM = [
   '轻调整 = 只在原结构上润色：合并重复句子、删掉同义反复、把长句剪短，不删整段，不改语气，不补新事实。',
   '任何可执行的用法、命令、路径、版本号、坑与限制都必须原样保留——那是以后要照着做的。',
   '只改正文，不改关键词、不改 YAML 头。目标篇幅：原文的 75%–90%；少于 75% 算删过头，超过 90% 算没压到位。',
-  '只输出 JSON：{"items":[{"file":"x.md","body":"改写后的完整正文"}]}，不要解释、不要代码围栏。',
+  '改完调用 submit_rewrites 提交，每一份都要给，file 只能是给你的文件名。没有工具可用时，输出 JSON：{"items":[{"file":"x.md","body":"改写后的完整正文"}]}，不要解释、不要代码围栏。',
 ].join('\n');
 
 const COMPRESS_HEAVY_SYSTEM = [
   '你是记忆的中删减器。用户会给你若干条记忆（关键词 + 正文），是他长期积累的笔记。',
   '中删减 = 合并小节、删掉过时或重复的段落、把清单压成更短的行，但不许删掉任何可执行的用法、命令、路径、版本号、坑与限制。',
   '不补新事实，不改语气，不改关键词，不改 YAML 头。目标篇幅：原文的 50%–70%；少于 50% 算删过头，超过 70% 算没压到位。',
-  '只输出 JSON：{"items":[{"file":"x.md","body":"改写后的完整正文"}]}，不要解释、不要代码围栏。',
+  '改完调用 submit_rewrites 提交，每一份都要给，file 只能是给你的文件名。没有工具可用时，输出 JSON：{"items":[{"file":"x.md","body":"改写后的完整正文"}]}，不要解释、不要代码围栏。',
 ].join('\n');
 
 let compressRunning = false;
@@ -992,15 +1004,11 @@ let compressRunning = false;
  * 而不是让它在自由文本里手写 JSON——后者才是「模型没有返回 JSON」的根源。
  */
 const WRITE_TOOL_DESCRIPTION = [
-  '记住一件以后还会用到的事。任务收尾时过一遍：有没有新的稳定事实、可复用的做法、或一次纠正？有就写一条，最多一条。',
-  '首词是分类：资料 / 教训 / 说明书 / 其它（项目记忆 只由用户点「大脑」按钮生成）。',
-  '写之前先查重（必填 dup_check）：先按索引里的名称和关键词自己判断有没有相似/相同/相关的记忆，拿不准就用 memory_read 打开那几条读全文再判断——相似就改它、相关就把内容并进去（append:true）、相同就别新建。把结论写进 dup_check，提到名字就必须真读过。',
-  'keywords 是钩子，不是句子：写「什么场景下必须点开这条」，但要短——每段 ≤10 字、1~4 段用 / 分隔。像标题党一样勾人，别写成「……前看」「……怎么用」这种尾巴。空泛词（插件、记忆、工具、说明、回忆）等于没写。',
-  '钩子要泛化到「场面」：写成 `删家目录`、`会话注入`、`MCP 连不上` 这种一看就知道自己正处在那场面里的词，别写成一次性任务名或只有你懂的缩写——多个场合都能命中才点得进来。',
-  '· 教训：`教训/删家目录/重装DSH` · `教训/装完即验收` · `教训/会话注入/自拼消息`。',
-  '· 资料：`资料/中文乱码/代码页` · `资料/称呼/基本信息`。',
-  '· 说明书：`说明书/MCP/懒加载` · `说明书/记忆读写/索引`。',
-  '教训里别写错误码和根因（422、报错、根因是缺 role），你正要犯错时想不到它们。',
+  '记住一件以后还会用到的事：新的稳定事实、可复用的做法、或一次纠正，最多一条。首词是分类：资料 / 教训 / 说明书 / 其它（项目记忆 只由用户点「大脑」按钮生成）。',
+  '写之前先查重（必填 dup_check）：按索引里的名称和关键词自己判断，拿不准就 memory_read 读全文——相似就改它、相关就 append:true 并进去、相同就别新建。结论写进 dup_check，提到名字就必须真读过。',
+  'keywords 是钩子不是句子：写「什么场景下必须点开这条」，每段 ≤10 字、1~4 段用 / 分隔。要像标题党一样勾人，写成一看就知道「我正处在这个场面」的词（`删家目录`、`会话注入`、`MCP 连不上`），别写「……前看」尾巴、一次性任务名或只有你懂的缩写；空泛词（插件、记忆、工具、说明、回忆）等于没写。',
+  '· 教训：`教训/删家目录/重装DSH`；资料：`资料/中文乱码/代码页`；说明书：`说明书/MCP/懒加载`。',
+  '教训里别写错误码和根因（422、报错、根因是缺 role）——你正要犯错时想不到它们。',
   '写「教训」时 body 必须三段，缺一段就没有预防作用：① 场景（什么任务、什么动作会踩到，读者一看就知道「我现在正在这个场景里」）；② 错误链条（第一步做什么、哪步开始不对、为什么没察觉）；③ 绕开与修复（下次怎么走、已部署什么防护）。',
 ].join(' ');
 
@@ -1373,29 +1381,103 @@ async function chatJson(key, body) {
   return { payload: out.payload, content };
 }
 
+const COMPRESS_TOOL_NAME = 'submit_rewrites';
+
+/**
+ * 压缩提案的工具声明：file 用 enum 锁死本批候选文件名，
+ * 模型写不出不存在的文件，也不会把 items/body 这类字段名写错。
+ */
+function compressToolSpec(files) {
+  return {
+    type: 'function',
+    function: {
+      name: COMPRESS_TOOL_NAME,
+      description: '提交改写后的记忆正文。每一份都要提交，不能漏、不能改名、不能加新文件。',
+      parameters: {
+        type: 'object',
+        properties: {
+          items: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                file: { type: 'string', enum: files },
+                body: { type: 'string', description: '改写后的完整正文（Markdown，不含 YAML 头与关键词）' },
+              },
+              required: ['file', 'body'],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ['items'],
+        additionalProperties: false,
+      },
+    },
+  };
+}
+
+/** 从回包里取工具调用填好的 items；模型没调工具、参数被截断都返回空数组。 */
+function toolCallItems(payload) {
+  const calls = payload?.choices?.[0]?.message?.tool_calls;
+  if (!Array.isArray(calls)) return [];
+  for (const call of calls) {
+    if (call?.function?.name !== COMPRESS_TOOL_NAME) continue;
+    try {
+      const parsed = JSON.parse(call.function.arguments || '');
+      const items = Array.isArray(parsed) ? parsed : parsed.items;
+      if (Array.isArray(items)) return items.filter((it) => it && it.file && typeof it.body === 'string');
+    } catch {
+      /* 参数被截断或不是 JSON，试下一个调用 */
+    }
+  }
+  return [];
+}
+
 /**
  * 一条压缩对话里的一轮：同一档位的所有批次共用一条 messages 链。
  * 后续请求把前面的「批次 + 助手改稿」当前缀，DeepSeek 的自动前缀缓存就能吃上，
  * 命中率随批次推进升高（2026-10-28 用户问「串行放进一个对话有没有用」——有用，就这么做）。
+ *
+ * 2026-11-18 起改稿走原生 tool-call：file 用 enum 锁死本批候选，结构由协议保证，
+ * 不再靠散文描述形状；没拿到工具调用就重试一次，仍没有才降级回 json_object 文本模式。
  */
-async function compressTurn(key, chain, userContent) {
+async function compressTurn(key, chain, userContent, files, budgetChars) {
   chain.push({ role: 'user', content: userContent });
-  const out = await chatJson(key, {
-    model: COMPRESS_MODEL,
-    thinking: { type: 'disabled' },
-    max_tokens: COMPRESS_MAX_TOKENS,
+  const maxTokens = compressMaxTokens(budgetChars);
+  const base = { model: COMPRESS_MODEL, thinking: { type: 'disabled' }, max_tokens: maxTokens };
+  const withTool = () => ({
+    ...base,
     messages: chain,
-    response_format: { type: 'json_object' },
+    tools: [compressToolSpec(files)],
+    tool_choice: { type: 'function', function: { name: COMPRESS_TOOL_NAME } },
   });
+
+  let out = await chatOnce(key, withTool());
+  let items = toolCallItems(out.payload);
+  let mode = 'tool';
+  if (!items.length) {
+    const choice = out.payload?.choices?.[0] || {};
+    compressTrace(
+      `工具调用没拿到 items（finish=${choice.finish_reason}，正文 ${Array.from(String(out.content || '')).length} 字，max_tokens=${maxTokens}），重试一次`,
+    );
+    out = await chatOnce(key, withTool());
+    items = toolCallItems(out.payload);
+  }
+  if (!items.length) {
+    compressTrace('两次都没调工具，降级成 JSON 文本模式');
+    out = await chatJson(key, { ...base, messages: chain, response_format: { type: 'json_object' } });
+    items = parseCompressItems(out.content);
+    mode = 'json';
+  }
   const usage = out.payload?.usage || {};
   const hit = usage.prompt_cache_hit_tokens ?? 0;
   const miss = usage.prompt_cache_miss_tokens ?? 0;
   const rate = hit + miss ? Math.round((hit / (hit + miss)) * 100) : 0;
   compressTrace(
-    `缓存命中 ${hit} / 未命中 ${miss}（${rate}%），输出 ${Array.from(out.content).length} 字，completion=${usage.completion_tokens ?? '?'}，reasoning=${usage.completion_tokens_details?.reasoning_tokens ?? 0}`,
+    `[${mode}] 缓存命中 ${hit} / 未命中 ${miss}（${rate}%），max_tokens=${maxTokens}，改写 ${items.length} 份，completion=${usage.completion_tokens ?? '?'}，reasoning=${usage.completion_tokens_details?.reasoning_tokens ?? 0}`,
   );
-  chain.push({ role: 'assistant', content: out.content });
-  return out;
+  chain.push({ role: 'assistant', content: JSON.stringify({ items }) });
+  return { payload: out.payload, items, mode };
 }
 
 /** 一档一批：先要一次改稿；偏长就带着比例反馈，在同一条对话里再要一次。 */
@@ -1413,8 +1495,11 @@ async function compressBatch(key, chains, system, items, range) {
       };
     });
 
-  let out = await compressTurn(key, chain, payload(''));
-  let got = parseCompressItems(out.content);
+  const files = items.map((it) => it.file);
+  const budget = items.reduce((n, it) => n + Array.from(String(it.body || '')).length, 0);
+
+  let out = await compressTurn(key, chain, payload(''), files, budget);
+  let got = out.items;
   let ratios = ratiosOf(got);
   const tooLong = ratios.filter((r) => r.ratio > range.max + 0.02);
   if (tooLong.length) {
@@ -1425,8 +1510,10 @@ async function compressBatch(key, chains, system, items, range) {
       payload(
         `上一轮改稿占原文 ${tooLong.map((r) => `${(r.ratio * 100).toFixed(0)}%`).join('、')}，还是太长。这一轮必须压到原文的 ${Math.round(range.min * 100)}%–${Math.round(range.max * 100)}%，可执行内容照样一字不丢。`,
       ),
+      files,
+      budget,
     );
-    got = parseCompressItems(out.content);
+    got = out.items;
     ratios = ratiosOf(got);
   }
   return got.map((it) => ({ ...it, ratio: ratios.find((r) => r.file === it.file)?.ratio ?? 1 }));
@@ -2747,3 +2834,6 @@ export function apply(ctx) {
     }, 'memory routes');
   });
 }
+
+/** 给 tools/selfcheck.mjs 用的纯函数出口：压缩预算、工具声明、回包解析。 */
+export const __test = { compressMaxTokens, compressToolSpec, toolCallItems, parseCompressItems, COMPRESS_MAX_TOKENS, COMPRESS_MAX_TOKENS_CAP };

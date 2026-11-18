@@ -1,4 +1,4 @@
-﻿# dsh-memory
+# dsh-memory
 
 一个 **DeepSeek Harness** 插件：把「跨对话的记忆」做成一摞本地 Markdown + 一张索引表，再配上一套管理界面。
 零依赖、无构建，纯手写 JavaScript（Host 半 + Client 半）。
@@ -64,7 +64,7 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
 - `memory:outline`（order 9890）：按分类分组的多行索引，取自 `MEMORY.md`，停用条目不出现。开头两行是**场景钩子说明**（2026-11-13 改短）：关键词写的是「什么场景下必须点开这条」；动手改 / 删 / 装 / 跑命令之前先扫【教训】，提到旧事或接手旧任务扫对应分组，拿不准就查（查错一次调用，漏查要返工）。其后每行一组：`【教训】…`、`【资料】…`、`【说明书】…`、`【项目记忆】…`；组名已表明分类，关键词里省掉重复的前缀。教训组永远排第一。
   单条关键词超过 42 字时在 `/` 边界裁剪并加 `…`（预算扣掉分类前缀）；**不做整行截断**，任何一条记忆都不会从大纲里消失（旧的 240 字整行截断实测丢过 `huashu-motion-install`）。
   只要存在启用的教训，末尾追加一句前置检查：「【教训】的钩子写的是「会闯祸的场面」：命中就先 memory_read 读完，再动手。」
-  静态成本约 2.2K token/请求（大纲三段 + 四个工具声明 = 3197 字，见 `PROMPTS.md`），不随记忆条数线性涨（单条关键词有裁剪上限）。
+  静态成本约 2.1K token/请求（大纲三段 + 四个工具声明 = 3038 字，见 `PROMPTS.md`），不随记忆条数线性涨（单条关键词有裁剪上限）。
 - `memory:tidy-status`（order 9900）：正常时零输出，异常才一行「待审批 N 份 / 上次失败：原因」。
 
 **动手前提醒（2026-11-14 新增）**：光靠索引常驻不够——模型动手那一刻经常不回头看大纲。所以 `tools/post-execute` 里盯着本轮**第一次** `write / edit / pwsh / computer_use / memory_delete / memory_update`，在工具结果后面追加一段 text block：`【教训提醒】动手前扫一眼…：noahs-ark=删家目录/重装DSH · …`（`lessonHooksLine()`，最多 8 条）。同一轮只提醒一次（`lastRemindTurn`），该轮已经用 `memory_read` 读过任何教训就闭嘴（`lessonReadThisTurn()` 查 `recall.json` 当前轮）。这是**场景触发**：成本约 100 token/轮且只在真要动手时出现。
@@ -149,7 +149,11 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
 
 另有两类永远不送模型：锁定、已有待审改稿。触发点两个：全局轮计数每满 100 轮（`turnCount % 100 === 0`，只数人类消息），以及设置页「仿生压缩」按钮。
 
-送模型的内容：一组「关键词 + 正文」+ 固定系统提示词（`model: deepseek-flash`、`thinking:{type:'disabled'}`、`response_format: json_object`、`max_tokens: 8192`），不带任何 DSH 工具提示。目标篇幅：轻调整 75%–90%、中删减 50%–70%（2026-10-28 用户定稿）；这些记忆写得很密，实测模型通常只能压到 95% 左右，所以比例是「尽量」不是门槛——只要比原文短 3% 就先给人看，没达标的在 detail 里标「未达目标比例」。压缩中途被关掉时 `compress.json` 只剩 `startedAt`，超过 15 分钟没 `finishedAt` 就在面板上显示「上次压缩中断」并把按钮变色。
+送模型的内容：一组「关键词 + 正文」+ 固定系统提示词（`model: deepseek-flash`、`thinking:{type:'disabled'}`），不带任何 DSH 工具提示。目标篇幅：轻调整 75%–90%、中删减 50%–70%（2026-10-28 用户定稿）；这些记忆写得很密，实测模型通常只能压到 95% 左右，所以比例是「尽量」不是门槛——只要比原文短 3% 就先给人看，没达标的在 detail 里标「未达目标比例」。压缩中途被关掉时 `compress.json` 只剩 `startedAt`，超过 15 分钟没 `finishedAt` 就在面板上显示「上次压缩中断」并把按钮变色。
+
+**改稿走工具调用（2026-11-18）**：改稿不再是「让模型手写 JSON」，而是注册一个 `submit_rewrites` 工具、用 `tool_choice` 点名，参数 schema 里 `file` 用 **enum 锁死本批候选文件名**、`items[].{file,body}` 必填、`additionalProperties:false`。模型因此写不出不存在的文件、也不会把字段名写错；拿不到工具调用就原样重试一次，两次都拿不到才降级回 `response_format:{type:'json_object'}` 文本模式（`parseCompressItems()` 仍在，容围栏与前后废话）。
+
+**输出预算按正文量算（2026-11-18）**：`max_tokens = clamp(本批正文字数 × 1.6 + 1024, 8192, 65536)`。改前固定 8192，实测一次 4 份的批次输出 7378 字紧贴上限，截断后 JSON 只剩半截，报成「模型输出里没有 JSON 对象」——`.tidy/compress.log` 里那几条「批次失败」正是这个原因。官方 max output 384K，这里只用了很小一部分。
 
 **串行对话 + 前缀缓存（2026-10-28）**：同一档位的所有批次共用一条 `messages` 链（批次 → 助手改稿 → 下一批），DeepSeek 的自动前缀缓存因此一轮比一轮吃得多。实测同一组记忆：第 1 批 0%、重压那轮 65%、第 2 批 77%、重压 83%。每轮命中数/未命中数都写进 `.tidy/compress.log`。
 
@@ -175,7 +179,7 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
 
 ## 工具（`tools/`）
 
-- `selfcheck.mjs`：mock 一个 cordis ctx 把 `apply()` 整条路径跑起来（临时 `DSH_HOME`，不碰真实记忆库），覆盖装载面、大纲、闸门、status、分类约束、回忆统计、新建/删除、搜索、压缩、/remember、调用流水、保留与动手前提醒、查重（模型自己判断）/并条目/空泛词/淘汰线/破坏性命令闸门、总量口径与提示词检视共 241 项。**改完先跑它，再考虑重启**：`node tools/selfcheck.mjs`。
+- `selfcheck.mjs`：mock 一个 cordis ctx 把 `apply()` 整条路径跑起来（临时 `DSH_HOME`，不碰真实记忆库），覆盖装载面、大纲、闸门、status、分类约束、回忆统计、新建/删除、搜索、压缩、/remember、调用流水、保留与动手前提醒、查重（模型自己判断）/并条目/空泛词/淘汰线/破坏性命令闸门、总量口径、提示词检视与压缩结构化输出共 258 项。**改完先跑它，再考虑重启**：`node tools/selfcheck.mjs`。
 - `tidy.mjs` + `run.cmd`：旧的「整理」worker，**已不再挂计划任务**（压缩不是定时任务）。保留作手动兜底：`node tools/tidy.mjs [--dry-run|--if-due]`，只写 `proposed/` 与 `status.json`。
 
 ## 未完成
