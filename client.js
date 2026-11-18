@@ -62,6 +62,59 @@ window.__ModuleLoader__.load({
       border: '1px solid var(--dsw-alias-border-l2)',
     };
 
+    // 记忆总量口径的六档（短标签只管面板好看；正文那句在 index.js 的 TIER_LINES，模型看到的是那句）。
+    const TIER_LABELS = [
+      ['宽松', '新主题直接开一条'],
+      ['偏松', '新主题优先开一条'],
+      ['均衡', '能改旧条目就别开新的'],
+      ['偏紧', '优先改写'],
+      ['收紧', '同一件事只留一条'],
+      ['极紧', '一律改写或并入'],
+    ];
+
+    const SORT_KEY = 'dsh-memory.sort';
+    function readSort() {
+      try {
+        return localStorage.getItem(SORT_KEY) === 'time' ? 'time' : 'recall';
+      } catch {
+        return 'recall';
+      }
+    }
+
+    const CLOCK_ICON = h(
+      'svg',
+      {
+        width: 12,
+        height: 12,
+        viewBox: '0 0 24 24',
+        fill: 'none',
+        stroke: 'currentColor',
+        strokeWidth: 2,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
+        'aria-hidden': 'true',
+      },
+      h('circle', { cx: 12, cy: 12, r: 9 }),
+      h('path', { d: 'M12 7v5l3 2' }),
+    );
+
+    const TREND_ICON = h(
+      'svg',
+      {
+        width: 12,
+        height: 12,
+        viewBox: '0 0 24 24',
+        fill: 'none',
+        stroke: 'currentColor',
+        strokeWidth: 2,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
+        'aria-hidden': 'true',
+      },
+      h('path', { d: 'M3 17l5-5 4 4 7-8' }),
+      h('path', { d: 'M15 8h4v4' }),
+    );
+
     const CHECK_ICON = h(
       'svg',
       {
@@ -210,6 +263,147 @@ window.__ModuleLoader__.load({
         every,
         label: `整圈 ${every} 轮：已走 ${since} 轮（浅蓝），其中 ${recallSince} 轮想到过记忆（深蓝）`,
       };
+    }
+
+    /** 一个统计小方块：大数字 + 小字说明。面板顶部那一排，主次分明靠字号而不是靠加粗。 */
+    function StatTile(props) {
+      return h(
+        'div',
+        {
+          title: props.hint || '',
+          style: {
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 0,
+            minWidth: 74,
+            padding: '5px 10px',
+            border: '1px solid var(--dsw-alias-border-l1)',
+            borderRadius: 'var(--dsw-radius-sm)',
+            background: 'var(--dsw-alias-bg-base)',
+          },
+        },
+        h(
+          'span',
+          {
+            style: {
+              display: 'flex',
+              alignItems: 'baseline',
+              gap: 1,
+              fontSize: 18,
+              fontWeight: 600,
+              lineHeight: '22px',
+              fontVariantNumeric: 'tabular-nums',
+              color: props.tone || 'var(--dsw-alias-label-primary)',
+            },
+          },
+          String(props.value),
+          props.unit ? h('span', { style: { fontSize: 11, fontWeight: 500, opacity: 0.55 } }, props.unit) : null,
+        ),
+        h('span', { style: { fontSize: 11, lineHeight: '15px', color: 'var(--dsw-alias-label-secondary)' } }, props.label),
+      );
+    }
+
+    /**
+     * 六档口径的量表：柱子由矮到高，越往右越收紧。
+     * 模型看不到自己在第几档（只看到一句口径），人在这里能看到「现在被推到哪了」。
+     */
+    function TierGauge(props) {
+      const tier = Math.max(1, Math.min(6, Number(props.tier) || 1));
+      const label = TIER_LABELS[tier - 1];
+      const bars = [];
+      for (let i = 1; i <= 6; i += 1) {
+        bars.push(
+          h('span', {
+            key: i,
+            style: {
+              width: 7,
+              height: 6 + i * 2,
+              borderRadius: 1.5,
+              background: 'var(--dsw-alias-brand-primary)',
+              opacity: i === tier ? 1 : i < tier ? 0.32 : 0.1,
+            },
+          }),
+        );
+      }
+      return h(
+        'div',
+        {
+          title: props.hint || '',
+          style: {
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 3,
+            padding: '5px 10px',
+            border: '1px solid var(--dsw-alias-border-l1)',
+            borderRadius: 'var(--dsw-radius-sm)',
+            background: 'var(--dsw-alias-bg-base)',
+            minWidth: 118,
+          },
+        },
+        h(
+          'span',
+          { style: { display: 'flex', alignItems: 'baseline', gap: 4 } },
+          h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } }, '口径'),
+          h(
+            'span',
+            { style: { fontSize: 18, fontWeight: 600, lineHeight: '22px', fontVariantNumeric: 'tabular-nums' } },
+            String(tier),
+          ),
+          h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } }, `/6 · ${label[0]}`),
+        ),
+        h('span', { style: { display: 'flex', alignItems: 'flex-end', gap: 3, height: 18 } }, bars),
+        h('span', { style: { fontSize: 11, lineHeight: '15px', color: 'var(--dsw-alias-label-secondary)' } }, label[1]),
+      );
+    }
+
+    /** 卡片上那条极细的回忆率条：数字是次要信息，长度才是脑子一眼能比的东西。 */
+    function RecallMeter(props) {
+      const rate = props.rate;
+      if (rate === null || rate === undefined) {
+        return h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } }, '未统计');
+      }
+      const width = Math.max(0, Math.min(100, Number(rate) || 0));
+      return h(
+        'span',
+        {
+          title: `最近 ${props.windowTurns || 100} 轮里，有 ${rate}% 的轮次读到过它`,
+          style: { display: 'inline-flex', alignItems: 'center', gap: 5 },
+        },
+        h(
+          'span',
+          {
+            style: {
+              position: 'relative',
+              width: 42,
+              height: 4,
+              borderRadius: 2,
+              overflow: 'hidden',
+              background: 'var(--dsw-alias-border-l2)',
+            },
+          },
+          h('span', {
+            style: {
+              position: 'absolute',
+              left: 0,
+              top: 0,
+              bottom: 0,
+              width: `${width}%`,
+              background: width > 0 ? 'var(--dsw-alias-brand-primary)' : 'transparent',
+            },
+          }),
+        ),
+        h(
+          'span',
+          {
+            style: {
+              fontSize: 11,
+              fontVariantNumeric: 'tabular-nums',
+              color: 'var(--dsw-alias-label-secondary)',
+            },
+          },
+          `${rate}%`,
+        ),
+      );
     }
 
     const LOCK_ICON = h(
@@ -1286,6 +1480,15 @@ window.__ModuleLoader__.load({
       const [query, setQuery] = React.useState('');
       const [search, setSearch] = React.useState(null); // { q, matches:[{file,hits,snippets}] }
       const [collapsed, setCollapsed] = React.useState({}); // 分类 → true 表示折叠
+      const [sortBy, setSortBy] = React.useState(readSort); // 'recall' | 'time'
+      const changeSort = (next) => {
+        setSortBy(next);
+        try {
+          localStorage.setItem(SORT_KEY, next);
+        } catch {
+          /* 隐私模式下写不进就算了，本次会话仍然生效 */
+        }
+      };
       const [compressing, setCompressing] = React.useState(false);
       // 记忆状态同时在这里显示一份：输入框那条万一没挂上，设置页也能看到结果。
       const rememberState = useRemember();
@@ -1515,7 +1718,22 @@ window.__ModuleLoader__.load({
       const proposals = (data && data.proposal && data.proposal.files) || [];
       const proposalFor = (file) => proposals.find((p) => p.file === file);
       const matched = search && search.q ? new Map(search.matches.map((m) => [m.file, m])) : null;
-      const visible = entries.filter((e) => !matched || matched.has(e.file));
+      // 「最近动过」用卡片参数里那个文件系统 mtime（精确到秒）；拿不到就退回复核日。
+      const updatedOf = (entry) => {
+        const hit = (entry.params || []).find((p) => p && p.label === '更新');
+        const t = hit ? Date.parse(String(hit.value).replace(' ', 'T')) : NaN;
+        if (Number.isFinite(t)) return t;
+        const r = Date.parse(`${entry.reviewed || ''}T00:00:00`);
+        return Number.isFinite(r) ? r : 0;
+      };
+      const sorter =
+        sortBy === 'time'
+          ? (a, b) => updatedOf(b) - updatedOf(a) || String(a.file).localeCompare(String(b.file))
+          : (a, b) =>
+              (b.recallRate ?? -1) - (a.recallRate ?? -1) ||
+              updatedOf(b) - updatedOf(a) ||
+              String(a.file).localeCompare(String(b.file));
+      const visible = entries.filter((e) => !matched || matched.has(e.file)).slice().sort(sorter);
       const categoryOf = (keywords) => {
         const head = String(keywords || '').split('/')[0].trim();
         return CATEGORIES.includes(head) ? head : '未分类';
@@ -1610,15 +1828,21 @@ window.__ModuleLoader__.load({
                     '文件已丢失',
                   )
                 : null,
-              h(
-                'span',
-                { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)' } },
-                entry.recallRate === null || entry.recallRate === undefined ? '回忆率 —' : `回忆率 ${entry.recallRate}%`,
-              ),
+              h(RecallMeter, { rate: entry.recallRate, windowTurns: data && data.windowTurns }),
               entry.pendingDelete
                 ? h(
                     'span',
-                    { style: { fontSize: 12, color: 'var(--dsw-alias-state-warn-primary)' } },
+                    {
+                      title: '复核太久没更新，且最近 100 轮里几乎没被读到——右侧「保留」可以否决，正文不动',
+                      style: {
+                        fontSize: 11,
+                        lineHeight: '16px',
+                        padding: '0 6px',
+                        borderRadius: 'var(--dsw-radius-sm)',
+                        border: '1px solid var(--dsw-alias-state-warn-primary)',
+                        color: 'var(--dsw-alias-state-warn-primary)',
+                      },
+                    },
                     '待删除',
                   )
                 : null,
@@ -1909,6 +2133,54 @@ window.__ModuleLoader__.load({
           query
             ? h('button', { type: 'button', style: BUTTON, onClick: () => setQuery('') }, '清空')
             : null,
+          // 排序分段控件：整块就是两个单元格，选中的那格换底色 + 加粗，比文字链接更容易一眼看出状态。
+          h(
+            'div',
+            {
+              role: 'group',
+              'aria-label': '记忆排序',
+              style: {
+                display: 'inline-flex',
+                border: '1px solid var(--dsw-alias-border-l2)',
+                borderRadius: 'var(--dsw-radius-md)',
+                overflow: 'hidden',
+                flex: '0 0 auto',
+              },
+            },
+            ...[
+              ['recall', '回忆率', TREND_ICON, '按最近 100 轮的回忆率从高到低'],
+              ['time', '时间', CLOCK_ICON, '按文件更新时间从新到旧'],
+            ].map(([key, text, icon, hint], i) => {
+              const on = sortBy === key;
+              return h(
+                'button',
+                {
+                  key,
+                  type: 'button',
+                  title: hint,
+                  'aria-pressed': on,
+                  onClick: () => changeSort(key),
+                  style: {
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 4,
+                    font: 'inherit',
+                    fontSize: 12,
+                    lineHeight: '20px',
+                    padding: '2px 9px',
+                    cursor: 'pointer',
+                    border: 'none',
+                    borderLeft: i ? '1px solid var(--dsw-alias-border-l1)' : 'none',
+                    background: on ? 'var(--dsw-alias-bg-layer-2)' : 'transparent',
+                    color: on ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)',
+                    fontWeight: on ? 600 : 400,
+                  },
+                },
+                h('span', { style: { display: 'inline-flex' } }, icon),
+                text,
+              );
+            }),
+          ),
           h('button', { type: 'button', style: BUTTON, onClick: () => reload() }, '刷新'),
           h(
             'button',
@@ -2067,50 +2339,73 @@ window.__ModuleLoader__.load({
               ),
             )
           : null,
-        // 单条「回忆率」永远偏低（一条记忆一次任务读一次就够），光看它会误以为机制坏了。
-        // 顶部那个环：整圈 = 一轮压缩周期（100 轮）；浅蓝 = 已经走了多少轮；深蓝 = 其中真有回忆的轮数。
+        // 顶部仪表：环（压缩周期）+ 三块数字 + 六档口径量表。
+        // 单条「回忆率」永远偏低（一条记忆一次任务读一次就够），光看它会误以为机制坏了，
+        // 所以主视角给这三个整体量；数字 18px、说明 11px，主次靠字号而不是靠加粗。
         data && data.recall
-          ? h(
-              'div',
-              {
-                title:
-                  '整圈 = 距下次压缩的 100 轮：浅蓝是已经走过的轮数，深蓝是其中真有回忆生效的轮数，浅灰是还没走到的部分。三者单位都是「轮」。',
-                style: {
-                  fontSize: 12,
-                  color: 'var(--dsw-alias-label-secondary)',
-                  padding: '2px 2px',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 12,
-                  flexWrap: 'wrap',
-                },
-              },
-              h(RecallRing, ringProps(data)),
-              h(
+          ? (() => {
+              const rp = ringProps(data);
+              const rc = data.recall;
+              const pr = data.prune || null;
+              const pendingCount = entries.filter((e) => e.pendingDelete).length;
+              const warn = 'var(--dsw-alias-state-warn-primary)';
+              return h(
                 'div',
-                { style: { display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'center', minWidth: 0 } },
-                h('span', null, `本轮周期已走 ${ringProps(data).since}/${ringProps(data).every} 轮`),
-                h('span', null, `其中 ${ringProps(data).recallSince} 轮想到过记忆`),
-                h('span', null, `覆盖 ${data.recall.covered}/${data.recall.total} 条`),
+                { style: { ...CARD, gap: 10, padding: '12px 14px' } },
                 h(
-                  'span',
-                  null,
-                  data.recall.lessonRate === null
-                    ? '教训 —'
-                    : `教训 ${data.recall.lessonTurns} 轮（${data.recall.lessonRate}%）`,
+                  'div',
+                  { style: { display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' } },
+                  h(
+                    'div',
+                    { style: { display: 'flex', alignItems: 'center', gap: 8 }, title: rp.label },
+                    h(RecallRing, rp),
+                    h(
+                      'div',
+                      { style: { display: 'flex', flexDirection: 'column' } },
+                      h(
+                        'span',
+                        { style: { fontSize: 12, fontWeight: 600, fontVariantNumeric: 'tabular-nums' } },
+                        `压缩周期 ${rp.since}/${rp.every} 轮`,
+                      ),
+                      h(
+                        'span',
+                        { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } },
+                        `其中 ${rp.recallSince} 轮有回忆`,
+                      ),
+                    ),
+                  ),
+                  h(
+                    'div',
+                    { style: { display: 'flex', gap: 8, flexWrap: 'wrap', marginLeft: 'auto' } },
+                    h(StatTile, {
+                      value: `${rc.covered}/${rc.total}`,
+                      label: '覆盖条数',
+                      hint: `最近 ${rc.window} 轮里被读到过的记忆条数 / 启用总数`,
+                    }),
+                    h(StatTile, {
+                      value: rc.lessonRate === null ? '—' : `${rc.lessonRate}%`,
+                      label: '教训回忆率',
+                      hint: `最近 ${rc.window} 轮里有 ${rc.lessonTurns} 轮读过【教训】`,
+                      tone: rc.lessonRate !== null && rc.lessonRate < 20 ? warn : undefined,
+                    }),
+                    h(StatTile, {
+                      value: pendingCount,
+                      label: '待删除',
+                      hint: pr
+                        ? `淘汰线：现在 ${pr.total} 条 → 复核超过 ${pr.days} 天、且最近 100 轮被读少于 ${pr.minHits} 次，就标「待删除」。点「保留」可以否决。`
+                        : '',
+                      tone: pendingCount ? warn : undefined,
+                    }),
+                    pr
+                      ? h(TierGauge, {
+                          tier: pr.tier,
+                          hint: `提示词口径由记忆总量自动推挡（PID，目标 50 条，现在 ${pr.total} 条）：条目多就收紧、条目少就放宽。模型只看到当前那一句口径，看不见档位。`,
+                        })
+                      : null,
+                  ),
                 ),
-                data.prune
-                  ? h(
-                      'span',
-                      {
-                        title: `条目变多，淘汰线自动收紧：现在 ${data.prune.total} 条 → 复核超过 ${data.prune.days} 天、且最近 100 轮被读少于 ${data.prune.minHits} 次，就标「待删除」。点「保留」可以否决。`,
-                        style: { opacity: 0.75 },
-                      },
-                      `淘汰线 >${data.prune.days} 天 / 回忆<${data.prune.minHits}`,
-                    )
-                  : null,
-              ),
-            )
+              );
+            })()
           : null,
         groups.length
           ? groups.map((group) => {
@@ -2146,7 +2441,30 @@ window.__ModuleLoader__.load({
                     },
                     CHEVRON_ICON,
                   ),
-                  h('span', null, `${group.cat} · ${group.list.length}`),
+                  h(
+                    'span',
+                    { style: { fontSize: 12, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' } },
+                    group.cat,
+                  ),
+                  h(
+                    'span',
+                    {
+                      style: {
+                        fontSize: 11,
+                        lineHeight: '16px',
+                        minWidth: 16,
+                        textAlign: 'center',
+                        padding: '0 5px',
+                        borderRadius: 8,
+                        background: 'var(--dsw-alias-bg-layer-2)',
+                        color: 'var(--dsw-alias-label-secondary)',
+                        fontVariantNumeric: 'tabular-nums',
+                      },
+                    },
+                    String(group.list.length),
+                  ),
+                  // 一条细线把标题和右边的留白分开：分组多了也能一眼扫到边。
+                  h('span', { style: { flex: '1 1 auto', height: 1, background: 'var(--dsw-alias-border-l1)' } }),
                 ),
                 isCollapsed ? null : group.list.map(card),
               );
