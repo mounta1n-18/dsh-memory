@@ -265,8 +265,11 @@ window.__ModuleLoader__.load({
       };
     }
 
-    /** 一个统计小方块：大数字 + 小字说明。面板顶部那一排，主次分明靠字号而不是靠加粗。 */
-    function StatTile(props) {
+    /**
+     * 一格仪表：小标题 / 大数字 / 一条比例条 / 一行脚注。
+     * 全部格子宽高一致、用 1px 竖线分隔，整排铺满可用宽度——数字之间不再留空洞。
+     */
+    function Metric(props) {
       return h(
         'div',
         {
@@ -274,38 +277,111 @@ window.__ModuleLoader__.load({
           style: {
             display: 'flex',
             flexDirection: 'column',
-            gap: 0,
-            minWidth: 74,
-            padding: '5px 10px',
-            border: '1px solid var(--dsw-alias-border-l1)',
-            borderRadius: 'var(--dsw-radius-sm)',
-            background: 'var(--dsw-alias-bg-base)',
+            justifyContent: 'center',
+            gap: 2,
+            minWidth: 0,
+            padding: '2px 12px',
+            borderLeft: props.first ? 'none' : '1px solid var(--dsw-alias-border-l1)',
           },
         },
         h(
           'span',
           {
             style: {
+              fontSize: 11,
+              lineHeight: '14px',
+              color: 'var(--dsw-alias-label-secondary)',
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+            },
+          },
+          props.label,
+        ),
+        h(
+          'span',
+          {
+            style: {
               display: 'flex',
               alignItems: 'baseline',
-              gap: 1,
-              fontSize: 18,
+              gap: 2,
+              fontSize: 19,
               fontWeight: 600,
-              lineHeight: '22px',
+              lineHeight: '24px',
               fontVariantNumeric: 'tabular-nums',
               color: props.tone || 'var(--dsw-alias-label-primary)',
             },
           },
           String(props.value),
-          props.unit ? h('span', { style: { fontSize: 11, fontWeight: 500, opacity: 0.55 } }, props.unit) : null,
+          props.unit ? h('span', { style: { fontSize: 11, fontWeight: 500, opacity: 0.5 } }, props.unit) : null,
         ),
-        h('span', { style: { fontSize: 11, lineHeight: '15px', color: 'var(--dsw-alias-label-secondary)' } }, props.label),
+        props.bar || null,
+        props.note
+          ? h(
+              'span',
+              {
+                style: {
+                  fontSize: 11,
+                  lineHeight: '14px',
+                  color: props.tone || 'var(--dsw-alias-label-secondary)',
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                },
+              },
+              props.note,
+            )
+          : null,
+      );
+    }
+
+    /** 比例条：宽度就是百分比，可选一条刻线（阈值）——比写「低于 20% 就警告」直观。 */
+    function MiniBar(props) {
+      const pct = Math.max(0, Math.min(100, Number(props.value) || 0));
+      return h(
+        'span',
+        {
+          style: {
+            position: 'relative',
+            display: 'block',
+            width: '100%',
+            height: 5,
+            margin: '3px 0 1px',
+            borderRadius: 3,
+            background: 'var(--dsw-alias-border-l2)',
+            overflow: 'hidden',
+          },
+        },
+        h('span', {
+          style: {
+            position: 'absolute',
+            left: 0,
+            top: 0,
+            bottom: 0,
+            width: `${pct}%`,
+            borderRadius: 3,
+            background: props.tone || 'var(--dsw-alias-brand-primary)',
+          },
+        }),
+        typeof props.threshold === 'number'
+          ? h('span', {
+              style: {
+                position: 'absolute',
+                top: 0,
+                bottom: 0,
+                left: `${Math.max(0, Math.min(100, props.threshold))}%`,
+                width: 1,
+                background: 'var(--dsw-alias-label-primary)',
+                opacity: 0.45,
+              },
+            })
+          : null,
       );
     }
 
     /**
-     * 六档口径的量表：柱子由矮到高，越往右越收紧。
-     * 模型看不到自己在第几档（只看到一句口径），人在这里能看到「现在被推到哪了」。
+     * 六档口径的量表：六根柱子由矮到高，越往右越收紧，当前档实心。
+     * 模型看不到自己在第几档（只看到一句口径），人在这里能看到「总量把它推到哪了」。
      */
     function TierGauge(props) {
       const tier = Math.max(1, Math.min(6, Number(props.tier) || 1));
@@ -316,11 +392,11 @@ window.__ModuleLoader__.load({
           h('span', {
             key: i,
             style: {
-              width: 7,
-              height: 6 + i * 2,
+              flex: '1 1 0',
+              height: 5 + i * 2.4,
               borderRadius: 1.5,
               background: 'var(--dsw-alias-brand-primary)',
-              opacity: i === tier ? 1 : i < tier ? 0.32 : 0.1,
+              opacity: i === tier ? 1 : i < tier ? 0.3 : 0.08,
             },
           }),
         );
@@ -332,27 +408,61 @@ window.__ModuleLoader__.load({
           style: {
             display: 'flex',
             flexDirection: 'column',
-            gap: 3,
-            padding: '5px 10px',
-            border: '1px solid var(--dsw-alias-border-l1)',
-            borderRadius: 'var(--dsw-radius-sm)',
-            background: 'var(--dsw-alias-bg-base)',
-            minWidth: 118,
+            justifyContent: 'center',
+            gap: 2,
+            minWidth: 0,
+            padding: '2px 12px',
+            borderLeft: '1px solid var(--dsw-alias-border-l1)',
           },
         },
         h(
           'span',
-          { style: { display: 'flex', alignItems: 'baseline', gap: 4 } },
-          h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } }, '口径'),
+          {
+            style: {
+              fontSize: 11,
+              lineHeight: '14px',
+              color: 'var(--dsw-alias-label-secondary)',
+              whiteSpace: 'nowrap',
+            },
+          },
+          '提示词口径',
+        ),
+        h(
+          'span',
+          { style: { display: 'flex', alignItems: 'baseline', gap: 3 } },
           h(
             'span',
-            { style: { fontSize: 18, fontWeight: 600, lineHeight: '22px', fontVariantNumeric: 'tabular-nums' } },
+            {
+              style: {
+                fontSize: 19,
+                fontWeight: 600,
+                lineHeight: '24px',
+                fontVariantNumeric: 'tabular-nums',
+              },
+            },
             String(tier),
           ),
           h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } }, `/6 · ${label[0]}`),
         ),
-        h('span', { style: { display: 'flex', alignItems: 'flex-end', gap: 3, height: 18 } }, bars),
-        h('span', { style: { fontSize: 11, lineHeight: '15px', color: 'var(--dsw-alias-label-secondary)' } }, label[1]),
+        h(
+          'span',
+          { style: { display: 'flex', alignItems: 'flex-end', gap: 2, height: 20, margin: '3px 0 1px' } },
+          bars,
+        ),
+        h(
+          'span',
+          {
+            style: {
+              fontSize: 11,
+              lineHeight: '14px',
+              color: 'var(--dsw-alias-label-secondary)',
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+            },
+          },
+          label[1],
+        ),
       );
     }
 
@@ -464,6 +574,20 @@ window.__ModuleLoader__.load({
     const FORM_LABEL = { flex: '0 0 auto', width: 64, fontSize: 12, color: 'var(--dsw-alias-label-secondary)' };
     // 分类就是首关键词；和模型的硬约束同一个清单，「项目记忆」只有人工通道能建。
     const CATEGORIES = ['资料', '教训', '说明书', '项目记忆', '其它'];
+
+    /** 分类色点：分组标题前面那一颗，只换色相、不抢正文。 */
+    const CATEGORY_COLORS = {
+      资料: '#4c8bf5',
+      教训: '#e2574c',
+      说明书: '#2fa36b',
+      项目记忆: '#8b5cf6',
+      其它: '#9aa0a6',
+      未分类: '#c4c7cc',
+    };
+
+    function categoryColor(cat) {
+      return CATEGORY_COLORS[cat] || CATEGORY_COLORS['其它'];
+    }
 
     function formatTime(iso) {
       return iso ? String(iso).slice(0, 16).replace('T', ' ') : '未运行';
@@ -2348,61 +2472,106 @@ window.__ModuleLoader__.load({
               const rc = data.recall;
               const pr = data.prune || null;
               const pendingCount = entries.filter((e) => e.pendingDelete).length;
+              const coverRate = rc.total ? Math.round((rc.covered / rc.total) * 100) : 0;
               const warn = 'var(--dsw-alias-state-warn-primary)';
               return h(
                 'div',
-                { style: { ...CARD, gap: 10, padding: '12px 14px' } },
+                { style: { ...CARD, gap: 0, padding: '10px 14px' } },
                 h(
                   'div',
-                  { style: { display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' } },
+                  {
+                    style: {
+                      display: 'grid',
+                      gridTemplateColumns: 'auto repeat(4, minmax(84px, 1fr))',
+                      alignItems: 'center',
+                    },
+                  },
                   h(
                     'div',
-                    { style: { display: 'flex', alignItems: 'center', gap: 8 }, title: rp.label },
-                    h(RecallRing, rp),
+                    {
+                      title: rp.label,
+                      style: { display: 'flex', alignItems: 'center', gap: 9, paddingRight: 14, minWidth: 0 },
+                    },
+                    h(RecallRing, { ...rp, size: 50, stroke: 5 }),
                     h(
                       'div',
-                      { style: { display: 'flex', flexDirection: 'column' } },
+                      { style: { display: 'flex', flexDirection: 'column', justifyContent: 'center' } },
                       h(
                         'span',
-                        { style: { fontSize: 12, fontWeight: 600, fontVariantNumeric: 'tabular-nums' } },
-                        `压缩周期 ${rp.since}/${rp.every} 轮`,
+                        {
+                          style: {
+                            fontSize: 13,
+                            fontWeight: 600,
+                            lineHeight: '18px',
+                            fontVariantNumeric: 'tabular-nums',
+                          },
+                        },
+                        `${rp.since}/${rp.every} 轮`,
                       ),
                       h(
                         'span',
-                        { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } },
+                        {
+                          style: {
+                            fontSize: 11,
+                            lineHeight: '14px',
+                            color: 'var(--dsw-alias-label-secondary)',
+                            whiteSpace: 'nowrap',
+                          },
+                        },
+                        '距下次压缩',
+                      ),
+                      h(
+                        'span',
+                        {
+                          style: {
+                            fontSize: 11,
+                            lineHeight: '14px',
+                            color: 'var(--dsw-alias-label-secondary)',
+                            whiteSpace: 'nowrap',
+                          },
+                        },
                         `其中 ${rp.recallSince} 轮有回忆`,
                       ),
                     ),
                   ),
-                  h(
-                    'div',
-                    { style: { display: 'flex', gap: 8, flexWrap: 'wrap', marginLeft: 'auto' } },
-                    h(StatTile, {
-                      value: `${rc.covered}/${rc.total}`,
-                      label: '覆盖条数',
-                      hint: `最近 ${rc.window} 轮里被读到过的记忆条数 / 启用总数`,
-                    }),
-                    h(StatTile, {
-                      value: rc.lessonRate === null ? '—' : `${rc.lessonRate}%`,
-                      label: '教训回忆率',
-                      hint: `最近 ${rc.window} 轮里有 ${rc.lessonTurns} 轮读过【教训】`,
-                      tone: rc.lessonRate !== null && rc.lessonRate < 20 ? warn : undefined,
-                    }),
-                    h(StatTile, {
-                      value: pendingCount,
-                      label: '待删除',
-                      hint: pr
-                        ? `淘汰线：现在 ${pr.total} 条 → 复核超过 ${pr.days} 天、且最近 100 轮被读少于 ${pr.minHits} 次，就标「待删除」。点「保留」可以否决。`
-                        : '',
-                      tone: pendingCount ? warn : undefined,
-                    }),
-                    pr
-                      ? h(TierGauge, {
-                          tier: pr.tier,
-                          hint: `提示词口径由记忆总量自动推挡（PID，目标 50 条，现在 ${pr.total} 条）：条目多就收紧、条目少就放宽。模型只看到当前那一句口径，看不见档位。`,
-                        })
-                      : null,
-                  ),
+                  h(Metric, {
+                    label: '覆盖条数',
+                    value: `${rc.covered}/${rc.total}`,
+                    bar: h(MiniBar, { value: coverRate }),
+                    note: `${coverRate}% 被读到过`,
+                    hint: `最近 ${rc.window} 轮里被读到过的记忆条数 / 启用总数（${rc.covered}/${rc.total}）`,
+                  }),
+                  h(Metric, {
+                    label: '教训回忆率',
+                    value: rc.lessonRate === null ? '—' : rc.lessonRate,
+                    unit: rc.lessonRate === null ? null : '%',
+                    tone: rc.lessonRate !== null && rc.lessonRate < 20 ? warn : undefined,
+                    bar:
+                      rc.lessonRate === null
+                        ? null
+                        : h(MiniBar, {
+                            value: rc.lessonRate,
+                            threshold: 20,
+                            tone: rc.lessonRate < 20 ? warn : undefined,
+                          }),
+                    note: `${rc.lessonTurns} 轮读过教训`,
+                    hint: `最近 ${rc.window} 轮里有 ${rc.lessonTurns} 轮读过【教训】；刻度线是 20% 的及格线`,
+                  }),
+                  h(Metric, {
+                    label: '待删除',
+                    value: pendingCount,
+                    tone: pendingCount ? warn : undefined,
+                    note: pendingCount ? '见卡片上小标' : '暂无',
+                    hint: pr
+                      ? `淘汰线：现在 ${pr.total} 条 → 复核超过 ${pr.days} 天、且最近 100 轮被读少于 ${pr.minHits} 次，就标「待删除」。点「保留」可以否决。`
+                      : '',
+                  }),
+                  pr
+                    ? h(TierGauge, {
+                        tier: pr.tier,
+                        hint: `提示词口径由记忆总量自动推挡（PID，目标 50 条，现在 ${pr.total} 条）：条目多就收紧、条目少就放宽。模型只看到当前那一句口径，看不见档位。`,
+                      })
+                    : null,
                 ),
               );
             })()
@@ -2441,6 +2610,15 @@ window.__ModuleLoader__.load({
                     },
                     CHEVRON_ICON,
                   ),
+                  h('span', {
+                    style: {
+                      width: 7,
+                      height: 7,
+                      borderRadius: 4,
+                      flex: '0 0 auto',
+                      background: categoryColor(group.cat),
+                    },
+                  }),
                   h(
                     'span',
                     { style: { fontSize: 12, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' } },
