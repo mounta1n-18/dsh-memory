@@ -58,7 +58,9 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
 
 **分组标题**：折叠箭头 + 一颗 7px 分类色点（资料蓝 `#4c8bf5`、教训红 `#e2574c`、说明书绿 `#2fa36b`、项目记忆紫 `#8b5cf6`、其它灰 `#9aa0a6`、未分类 `#c4c7cc`，见 `CATEGORY_COLORS`）+ 分类名 + 数字胶囊 + 撑满剩余宽度的细线。
 
-**进度环**（顶部仪表左边那个圆）：整圈就是一轮压缩周期（`compress.every` = 100 轮），两个量都以「轮」为单位直接叠在圈上——浅蓝 = 距上次压缩已经走了多少轮（`compress.sinceTurns`），深蓝 = 这些轮里真有记忆被回忆到的轮数（`compress.recallSince`，从 `recall.json` 里按 `turn > 上次压缩轮` 去重数出来），浅灰是还没走到的部分；深蓝压在浅蓝上面、同一起点，所以「深蓝有多长」就是这一周期里召回的实际产出占比，圆心写它的百分比。`compress.lastTurns` / `sinceTurns` / `recallSince` 由宿主在 `snapshot()` 里算好；老状态文件没有 `turns` 字段时退回 `turns % every` 估一个周期起点，不会显示成空环。
+**进度环**（顶部仪表左边那个圆）：整圈就是一轮压缩周期（`compress.every` = 100 轮），两个量都以「轮」为单位直接叠在圈上——品牌色 40% 透明 = 距上次压缩已经走了多少轮（`compress.sinceTurns`），品牌色实心 = 这些轮里真有记忆被回忆到的轮数（`compress.recallSince`，从 `recall.json` 里按 `turn > 上次压缩轮` 去重数出来），轨道是主题的 `--dsw-alias-border-l2`（浅色/深色模式都跟着换）；实心段压在浅段上面、同一起点，所以「实心有多长」就是这一周期里召回的实际产出占比，圆心写它的百分比。`compress.lastTurns` / `sinceTurns` / `recallSince` 由宿主在 `snapshot()` 里算好；老状态文件没有 `turns` 字段时退回 `turns % every` 估一个周期起点，不会显示成空环。
+
+**深色模式**：所有颜色都取主题变量（`--dsw-alias-*`），`client.js` 里不再有写死的环色与差异底色——早期版本用 `#e6e6e8` 环轨、`#ffc2c2` / `#b4efb4` 行底色，在深色主题下会刺眼，现改为 `--dsw-alias-border-l2` 与 `rgba(226,87,76,.28)` / `rgba(47,163,107,.28)` 叠色（深浅主题都读得清）。分类色点（`CATEGORY_COLORS`）是有意固定的辨识色，两种主题下都成立。`tools/selfcheck.mjs` 里有 `grep` 断言保证这几个写死色不再回潮。
 
 **排序**（`client.js`）：工具栏分段控件切「回忆率 / 时间」，选中态换底色加粗，选择写进 `localStorage['dsh-memory.sort']`。回忆率 = 窗口内被读百分比降序（同分按更新时间），时间 = 卡片参数里的文件 `mtime`（精确到秒）降序；分类分组不变，只在组内排序。卡片上原来的「回忆率 N%」文字换成一条 42px 的细条 + 数字，长度比数字更快能比。
 
@@ -185,7 +187,7 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
 
 ## 工具（`tools/`）
 
-- `selfcheck.mjs`：mock 一个 cordis ctx 把 `apply()` 整条路径跑起来（临时 `DSH_HOME`，不碰真实记忆库），覆盖装载面、大纲、闸门、status、分类约束、回忆统计、新建/删除、搜索、压缩、/remember、调用流水、保留与动手前提醒、查重（模型自己判断）/并条目/空泛词/淘汰线/破坏性命令闸门、总量口径、提示词检视与压缩结构化输出共 258 项。**改完先跑它，再考虑重启**：`node tools/selfcheck.mjs`。
+- `selfcheck.mjs`：mock 一个 cordis ctx 把 `apply()` 整条路径跑起来（临时 `DSH_HOME`，不碰真实记忆库），覆盖装载面、大纲、闸门、status、分类约束、回忆统计、新建/删除、搜索、压缩、/remember、调用流水、保留与动手前提醒、查重（模型自己判断）/并条目/空泛词/淘汰线/破坏性命令闸门、总量口径、提示词检视、压缩结构化输出、客户端配色不回潮共 266 项。**改完先跑它，再考虑重启**：`node tools/selfcheck.mjs`。
 - `tidy.mjs` + `run.cmd`：旧的「整理」worker，**已不再挂计划任务**（压缩不是定时任务）。保留作手动兜底：`node tools/tidy.mjs [--dry-run|--if-due]`，只写 `proposed/` 与 `status.json`。
 
 ## 未完成

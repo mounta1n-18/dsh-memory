@@ -1222,6 +1222,18 @@ console.log('\n[17] 压缩请求的结构化输出（工具调用 + 预算 + 回
   eq('降级解析容忍代码围栏', JSON.stringify(T.parseCompressItems('```json\n{"items":[{"file":"a.md","body":"z"}]}\n```')), JSON.stringify([{ file: 'a.md', body: 'z' }]));
 }
 
+console.log('\n[18] 客户端配色跟着主题走（深色模式不回潮）');
+{
+  const cli = fs.readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+  // 这几个写死色曾经只对浅色主题成立：环轨近白、差异行底色为浅粉/浅绿。
+  for (const hex of ['#e6e6e8', '#a8c8f5', '#2f6fe4', '#ffc2c2', '#b4efb4']) {
+    ok(`client.js 不再写死 ${hex}`, !cli.includes(`'${hex}'`));
+  }
+  ok('环轨取主题变量', cli.includes('var(--dsw-alias-border-l2)'));
+  ok('环的两段取品牌色', cli.includes("stroke: 'var(--dsw-alias-brand-primary)'"));
+  ok('差异行改成叠色（深浅主题都读得清）', cli.includes('rgba(226, 87, 76, 0.28)') && cli.includes('rgba(47, 163, 107, 0.28)'));
+}
+
 // 需要一份「模型能看到的全部提示词」时：DUMP_PROMPTS=<文件.md> node tools/selfcheck.mjs
 if (process.env.DUMP_PROMPTS) {
   const inv = await call(state, '/dsh-memory/prompts');
