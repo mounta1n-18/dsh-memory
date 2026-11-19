@@ -64,12 +64,12 @@ window.__ModuleLoader__.load({
 
     // 记忆总量口径的六档（短标签只管面板好看；正文那句在 index.js 的 TIER_LINES，模型看到的是那句）。
     const TIER_LABELS = [
-      ['宽松', '新主题直接开一条'],
-      ['偏松', '新主题优先开一条'],
-      ['均衡', '能改旧条目就别开新的'],
-      ['偏紧', '优先改写'],
-      ['收紧', '同一件事只留一条'],
-      ['极紧', '一律改写或并入'],
+      ['宽松', '新主题直接开'],
+      ['偏松', '新主题优先开'],
+      ['均衡', '能改就别新建'],
+      ['偏紧', '优先改写旧条'],
+      ['收紧', '一事只留一条'],
+      ['极紧', '一律并入或改写'],
     ];
 
     const SORT_KEY = 'dsh-memory.sort';
@@ -197,14 +197,21 @@ window.__ModuleLoader__.load({
           role: 'img',
           'aria-label': (props && props.label) || '',
         },
-        h('circle', { cx: mid, cy: mid, r, stroke: '#e6e6e8', ...common }),
-        // 浅蓝：距上次压缩已经走过的轮数（整圈 = 100 轮）
+        // 三个圆环全部走主题变量：浅深色模式下轨道、已走、已回忆都跟着换色。
+        h('circle', {
+          cx: mid,
+          cy: mid,
+          r,
+          style: { stroke: 'var(--dsw-alias-border-l2)' },
+          ...common,
+        }),
+        // 浅蓝：距上次压缩已经走过的轮数（整圈 = 100 轮）——品牌色压低透明度，深色模式下也不会刺眼
         fillLen > 0.01
           ? h('circle', {
               cx: mid,
               cy: mid,
               r,
-              stroke: '#a8c8f5',
+              style: { stroke: 'var(--dsw-alias-brand-primary)', strokeOpacity: 0.4 },
               strokeDasharray: `${fillLen} ${c - fillLen}`,
               transform: `rotate(-90 ${mid} ${mid})`,
               ...common,
@@ -216,7 +223,7 @@ window.__ModuleLoader__.load({
               cx: mid,
               cy: mid,
               r,
-              stroke: '#2f6fe4',
+              style: { stroke: 'var(--dsw-alias-brand-primary)' },
               strokeDasharray: `${percentLen} ${c - percentLen}`,
               transform: `rotate(-90 ${mid} ${mid})`,
               ...common,
@@ -230,7 +237,7 @@ window.__ModuleLoader__.load({
             textAnchor: 'middle',
             dominantBaseline: 'central',
             fontSize: Math.round(size * 0.24),
-            fill: 'currentColor',
+            style: { fill: 'var(--dsw-alias-label-primary)' },
           },
           `${Math.round(percent)}%`,
         ),
@@ -396,7 +403,7 @@ window.__ModuleLoader__.load({
               height: 5 + i * 2.4,
               borderRadius: 1.5,
               background: 'var(--dsw-alias-brand-primary)',
-              opacity: i === tier ? 1 : i < tier ? 0.3 : 0.08,
+              opacity: i === tier ? 1 : i < tier ? 0.35 : 0.14,
             },
           }),
         );
@@ -2151,14 +2158,12 @@ window.__ModuleLoader__.load({
                             wordBreak: 'break-word',
                             ...(row.kind === 'del'
                               ? {
-                                  background: '#ffc2c2',
-                                  color: '#000',
+                                  background: 'rgba(226, 87, 76, 0.28)',
                                 }
                               : {}),
                             ...(row.kind === 'add'
                               ? {
-                                  background: '#b4efb4',
-                                  color: '#000',
+                                  background: 'rgba(47, 163, 107, 0.28)',
                                 }
                               : {}),
                           },
@@ -2554,7 +2559,7 @@ window.__ModuleLoader__.load({
                             threshold: 20,
                             tone: rc.lessonRate < 20 ? warn : undefined,
                           }),
-                    note: `${rc.lessonTurns} 轮读过教训`,
+                    note: `${rc.lessonTurns} 轮读过`,
                     hint: `最近 ${rc.window} 轮里有 ${rc.lessonTurns} 轮读过【教训】；刻度线是 20% 的及格线`,
                   }),
                   h(Metric, {
