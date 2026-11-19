@@ -62,6 +62,8 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
 
 **深色模式**：所有颜色都取主题变量（`--dsw-alias-*`），`client.js` 里不再有写死的环色与差异底色——早期版本用 `#e6e6e8` 环轨、`#ffc2c2` / `#b4efb4` 行底色，在深色主题下会刺眼，现改为 `--dsw-alias-border-l2` 与 `rgba(226,87,76,.28)` / `rgba(47,163,107,.28)` 叠色（深浅主题都读得清）。分类色点（`CATEGORY_COLORS`）是有意固定的辨识色，两种主题下都成立。`tools/selfcheck.mjs` 里有 `grep` 断言保证这几个写死色不再回潮。
 
+**深色下的卡片开关**（`useIsDark()`）：`client.js` 在运行时读根元素上的 `--dsw-alias-bg-base` 算亮度判断深浅（读不到再退 `body` 背景色；`MutationObserver` + `prefers-color-scheme` 监听主题切换）。深色下开关放大到 36×20、拨钮缩到 14px：**关** = 半透明浅灰轨道（`rgba(255,255,255,.2)` + 同色系描边）+ 白拨钮停左，**开** = 品牌色轨道 + 白拨钮推右 + 2px 柔光；浅色模式下仍是原来的 34×18 实心拨钮样式，逻辑与尺寸完全不变。
+
 **排序**（`client.js`）：工具栏分段控件切「回忆率 / 时间」，选中态换底色加粗，选择写进 `localStorage['dsh-memory.sort']`。回忆率 = 窗口内被读百分比降序（同分按更新时间），时间 = 卡片参数里的文件 `mtime`（精确到秒）降序；分类分组不变，只在组内排序。卡片上原来的「回忆率 N%」文字换成一条 42px 的细条 + 数字，长度比数字更快能比。
 
 **批准只改正文**：`proposed/` 里只有正文，`approveFile()` 沿用原文件的 YAML 头（所以 description 不会被改稿冲掉），刷新复核日，删掉方案。
