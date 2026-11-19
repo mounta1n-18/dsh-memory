@@ -711,8 +711,100 @@ window.__ModuleLoader__.load({
     const dot = (color) => ({ width: 8, height: 8, borderRadius: '9999px', background: color, flex: '0 0 auto' });
     const stop = (ev) => ev.stopPropagation();
 
+    /**
+     * 判断当前是不是深色主题：DSH 的主题 token 都挂在根元素上，取背景色算亮度最稳。
+     * 只读，不写任何东西；主题切换时靠 MutationObserver 重新算（宿主换主题一般就是改根上的 class/属性）。
+     */
+    function parseColorLuma(raw) {
+      const text = String(raw || '').trim();
+      if (!text) return null;
+      const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(text);
+      if (hex) {
+        const h = hex[1].length === 3 ? hex[1].split('').map((c) => c + c).join('') : hex[1];
+        const n = parseInt(h, 16);
+        return 0.2126 * ((n >> 16) & 255) + 0.7152 * ((n >> 8) & 255) + 0.0722 * (n & 255);
+      }
+      const rgb = /^rgba?\(([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i.exec(text);
+      if (rgb) return 0.2126 * Number(rgb[1]) + 0.7152 * Number(rgb[2]) + 0.0722 * Number(rgb[3]);
+      return null;
+    }
+
+    function computeDarkTheme() {
+      try {
+        const root = getComputedStyle(document.documentElement);
+        const fromToken =
+          parseColorLuma(root.getPropertyValue('--dsw-alias-bg-base')) ??
+          parseColorLuma(root.getPropertyValue('--dsw-alias-bg-layer-1'));
+        if (fromToken !== null) return fromToken < 110;
+        const fromBody = document.body ? parseColorLuma(getComputedStyle(document.body).backgroundColor) : null;
+        if (fromBody !== null) return fromBody < 110;
+      } catch {
+        /* 拿不到就算浅色，不至于因此渲染不出来 */
+      }
+      return false;
+    }
+
+    const darkListeners = new Set();
+    let darkValue = null;
+    let darkWatcherOn = false;
+
+    function ensureDarkWatcher() {
+      if (darkWatcherOn) return;
+      darkWatcherOn = true;
+      darkValue = computeDarkTheme();
+      const tick = () => {
+        const next = computeDarkTheme();
+        if (next === darkValue) return;
+        darkValue = next;
+        darkListeners.forEach((fn) => fn(next));
+      };
+      try {
+        const mo = new MutationObserver(tick);
+        mo.observe(document.documentElement, { attributes: true });
+        if (document.body) mo.observe(document.body, { attributes: true });
+        const mq = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)');
+        if (mq && mq.addEventListener) mq.addEventListener('change', tick);
+      } catch {
+        /* 观察不了就保持首帧判断 */
+      }
+    }
+
+    /** 卡片开关等少数元素在深色下要换一套画法，其它颜色一律走主题变量。 */
+    function useIsDark() {
+      const [dark, setDark] = React.useState(() => (darkValue === null ? computeDarkTheme() : darkValue));
+      React.useEffect(() => {
+        darkListeners.add(setDark);
+        ensureDarkWatcher();
+        setDark(darkValue === null ? computeDarkTheme() : darkValue);
+        return () => {
+          darkListeners.delete(setDark);
+        };
+      }, []);
+      return dark;
+    }
+
     function Toggle(props) {
       const { checked, onChange } = props;
+      const dark = useIsDark();
+      // 深色下原来的 34×18 太小、拨钮几乎盖满整条轨道，远看只是一团灰：改成 36×20、拨钮缩到 14px，
+      // 「关」= 半透明浅灰轨道 + 白拨钮，「开」= 品牌色轨道 + 白拨钮（推右）+ 一圈柔光。
+      const track = dark
+        ? {
+            width: 36,
+            height: 20,
+            background: checked ? 'var(--dsw-alias-brand-primary)' : 'rgba(255, 255, 255, 0.2)',
+            border: `1px solid ${checked ? 'var(--dsw-alias-brand-primary)' : 'rgba(255, 255, 255, 0.28)'}`,
+            boxShadow: checked ? '0 0 0 2px rgba(76, 139, 245, 0.3)' : 'none',
+          }
+        : {
+            width: 34,
+            height: 18,
+            background: checked ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-border-l2)',
+            border: '1px solid transparent',
+          };
+      const knob = dark
+        ? { top: 3, left: checked ? 19 : 3, width: 14, height: 14, background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,0.3)' }
+        : { top: 2, left: checked ? 18 : 2, width: 14, height: 14, background: '#fff', boxShadow: 'none' };
       return h(
         'label',
         {
@@ -721,13 +813,12 @@ window.__ModuleLoader__.load({
           onDoubleClick: stop,
           style: {
             position: 'relative',
-            width: 34,
-            height: 18,
             flex: '0 0 auto',
             cursor: 'pointer',
             borderRadius: '9999px',
-            background: checked ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-border-l2)',
-            transition: 'background .15s',
+            boxSizing: 'border-box',
+            transition: 'background .15s, border-color .15s, box-shadow .15s',
+            ...track,
           },
         },
         h('input', {
@@ -739,14 +830,10 @@ window.__ModuleLoader__.load({
         h('span', {
           style: {
             position: 'absolute',
-            top: 2,
-            left: checked ? 18 : 2,
-            width: 14,
-            height: 14,
             borderRadius: '9999px',
-            background: '#fff',
-            transition: 'left .15s',
+            transition: 'left .15s, background .15s',
             pointerEvents: 'none',
+            ...knob,
           },
         }),
       );
