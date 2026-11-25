@@ -387,12 +387,147 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 口径控制方式：自动（PID 按总量推挡）/ 手动（用户锁定档位）。
+     * 做成两段小控件而不是开关——卡片上已经有一个「启用」开关，两种开关并排会认错。
+     */
+    function ModeSwitch(props) {
+      const seg = (value, text, hint) =>
+        h(
+          'button',
+          {
+            type: 'button',
+            title: hint,
+            onClick: () => props.onChange(value),
+            style: {
+              appearance: 'none',
+              border: 'none',
+              cursor: 'pointer',
+              padding: '1px 7px',
+              borderRadius: 5,
+              fontSize: 11,
+              lineHeight: '15px',
+              background: props.value === value ? 'var(--dsw-alias-bg-layer-2)' : 'transparent',
+              color: props.value === value ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)',
+              fontWeight: props.value === value ? 600 : 400,
+            },
+          },
+          text,
+        );
+      return h(
+        'span',
+        {
+          style: {
+            display: 'inline-flex',
+            gap: 2,
+            padding: 2,
+            borderRadius: 7,
+            border: '1px solid var(--dsw-alias-border-l1)',
+            background: 'var(--dsw-alias-bg-base)',
+          },
+        },
+        seg('auto', '自动', '由 PID 按记忆总量自动推挡（目标 50 条）'),
+        seg('manual', '手动', '锁定你选的档位；PID 仍在后台照常计算，切回自动随时接着用'),
+      );
+    }
+
+    /**
+     * 手动档位面板：自动模式下不出现；切到手动后替换 PID 卡片占满整行。
+     * 六张卡片按「宽松 → 极紧」排，选中那张用品牌色描边。
+     */
+    function ManualTierPanel(props) {
+      const active = Math.max(1, Math.min(6, Number(props.tier) || 1));
+      const tiles = TIER_LABELS.map((label, i) => {
+        const n = i + 1;
+        const on = n === active;
+        return h(
+          'button',
+          {
+            key: n,
+            type: 'button',
+            title: `${n} 档 · ${label[0]}：${label[1]}`,
+            onClick: () => props.onPick(n),
+            style: {
+              appearance: 'none',
+              cursor: 'pointer',
+              textAlign: 'left',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 1,
+              padding: '5px 8px',
+              borderRadius: 8,
+              minWidth: 0,
+              border: `1px solid ${on ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-border-l1)'}`,
+              background: on ? 'var(--dsw-alias-bg-layer-2)' : 'transparent',
+            },
+          },
+          h(
+            'span',
+            {
+              style: {
+                fontSize: 12,
+                fontWeight: 600,
+                lineHeight: '16px',
+                color: on ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-label-primary)',
+              },
+            },
+            `${n} 档`,
+          ),
+          h(
+            'span',
+            {
+              style: {
+                fontSize: 11,
+                lineHeight: '14px',
+                color: 'var(--dsw-alias-label-secondary)',
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              },
+            },
+            label[0],
+          ),
+        );
+      });      return h(
+        'div',
+        {
+          style: {
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            marginTop: 8,
+            paddingTop: 8,
+            borderTop: '1px solid var(--dsw-alias-border-l1)',
+          },
+        },
+        h(
+          'span',
+          { style: { fontSize: 11, lineHeight: '14px', color: 'var(--dsw-alias-label-secondary)', whiteSpace: 'nowrap' } },
+          '手动档位',
+        ),
+        h(
+          'div',
+          {
+            style: {
+              display: 'grid',
+              gridTemplateColumns: 'repeat(6, minmax(0, 1fr))',
+              gap: 6,
+              flex: '1 1 auto',
+              minWidth: 0,
+            },
+          },
+          tiles,
+        ),
+      );
+    }
+
+    /**
      * 六档口径的量表：六根柱子由矮到高，越往右越收紧，当前档实心。
      * 模型看不到自己在第几档（只看到一句口径），人在这里能看到「总量把它推到哪了」。
      */
     function TierGauge(props) {
       const tier = Math.max(1, Math.min(6, Number(props.tier) || 1));
       const label = TIER_LABELS[tier - 1];
+      const manual = props.mode === 'manual';
       const bars = [];
       for (let i = 1; i <= 6; i += 1) {
         bars.push(
@@ -426,13 +561,25 @@ window.__ModuleLoader__.load({
           'span',
           {
             style: {
-              fontSize: 11,
-              lineHeight: '14px',
-              color: 'var(--dsw-alias-label-secondary)',
-              whiteSpace: 'nowrap',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 6,
             },
           },
-          '提示词口径',
+          h(
+            'span',
+            {
+              style: {
+                fontSize: 11,
+                lineHeight: '14px',
+                color: 'var(--dsw-alias-label-secondary)',
+                whiteSpace: 'nowrap',
+              },
+            },
+            '提示词口径',
+          ),
+          h(ModeSwitch, { value: manual ? 'manual' : 'auto', onChange: props.onMode }),
         ),
         h(
           'span',
@@ -449,7 +596,11 @@ window.__ModuleLoader__.load({
             },
             String(tier),
           ),
-          h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } }, `/6 · ${label[0]}`),
+          h(
+            'span',
+            { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } },
+            manual ? `/6 · 手动 · ${label[0]}` : `/6 · ${label[0]}`,
+          ),
         ),
         h(
           'span',
@@ -1814,8 +1965,28 @@ window.__ModuleLoader__.load({
         return body;
       };
 
-      const saveKeywords = async (file) => {
+      // 口径控制方式：自动 = PID 按总量推挡，手动 = 锁定用户选的档位。
+      // 手动模式下宿主仍每轮推进 PID（积分/导数照算），所以切回自动能立刻接着用。
+      const setControl = async (mode, tier) => {
         try {
+          const body = await post(
+            '/dsh-memory/control',
+            typeof tier === 'number' ? { mode, tier } : { mode },
+          );
+          const ctl = (body && body.control) || null;
+          setBanner(
+            ctl && ctl.mode === 'manual'
+              ? `已锁手动第 ${ctl.activeTier} 档（PID 在后台仍算：自动本会取第 ${ctl.autoTier} 档）`
+              : `已切回自动：当前第 ${ctl ? ctl.activeTier : '?'} 档`,
+          );
+          setTimeout(() => setBanner(''), 3000);
+        } catch (err) {
+          setBanner(err.message);
+          setTimeout(() => setBanner(''), 3000);
+        }
+      };
+
+      const saveKeywords = async (file) => {        try {
           await post('/dsh-memory/keyword', { file, keywords: draft[file] ?? '' });
           setEditing(null);
           flash(file, '已保存');
@@ -2574,6 +2745,9 @@ window.__ModuleLoader__.load({
               const rp = ringProps(data);
               const rc = data.recall;
               const pr = data.prune || null;
+              const ctl = data.control || null;
+              const manual = Boolean(ctl && ctl.mode === 'manual');
+              const activeTier = ctl ? ctl.activeTier : pr ? pr.tier : 1;
               const pendingCount = entries.filter((e) => e.pendingDelete).length;
               const coverRate = rc.total ? Math.round((rc.covered / rc.total) * 100) : 0;
               const warn = 'var(--dsw-alias-state-warn-primary)';
@@ -2585,7 +2759,9 @@ window.__ModuleLoader__.load({
                   {
                     style: {
                       display: 'grid',
-                      gridTemplateColumns: 'auto repeat(4, minmax(84px, 1fr))',
+                      gridTemplateColumns: manual
+                        ? 'auto repeat(3, minmax(84px, 1fr))'
+                        : 'auto repeat(4, minmax(84px, 1fr))',
                       alignItems: 'center',
                     },
                   },
@@ -2669,13 +2845,23 @@ window.__ModuleLoader__.load({
                       ? `淘汰线：现在 ${pr.total} 条 → 复核超过 ${pr.days} 天、且最近 100 轮被读少于 ${pr.minHits} 次，就标「待删除」。点「保留」可以否决。`
                       : '',
                   }),
-                  pr
+                  pr || ctl
                     ? h(TierGauge, {
-                        tier: pr.tier,
-                        hint: `提示词口径由记忆总量自动推挡（PID，目标 50 条，现在 ${pr.total} 条）：条目多就收紧、条目少就放宽。模型只看到当前那一句口径，看不见档位。`,
+                        tier: activeTier,
+                        mode: manual ? 'manual' : 'auto',
+                        onMode: (next) => setControl(next, next === 'manual' ? activeTier : undefined),
+                        hint: manual
+                          ? `手动锁定第 ${activeTier} 档：PID 仍在后台按记忆总量计算（自动本会取第 ${ctl ? ctl.autoTier : '?'} 档），随时可切回自动接着用。`
+                          : `提示词口径由记忆总量自动推挡（PID，目标 50 条，现在 ${pr ? pr.total : '?'} 条，u=${ctl ? ctl.u : '?'}）：条目多就收紧、条目少就放宽。模型只看到当前那一句口径，看不见档位。`,
                       })
                     : null,
                 ),
+                manual
+                  ? h(ManualTierPanel, {
+                      tier: activeTier,
+                      onPick: (n) => setControl('manual', n),
+                    })
+                  : null,
               );
             })()
           : null,

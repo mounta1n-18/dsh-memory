@@ -30,6 +30,9 @@ const LINKS = path.join(TIDY, 'links.json'); // 记忆之间的关系边：{ "a.
 const LINK_LIMIT = 4; // 读一条记忆时最多顺带提示几条相关记忆
 const TURNS = path.join(TIDY, 'turns.json'); // 全局用户轮计数 {count}
 const WINDOW_TURNS = 100; // 回忆率的统计窗口 = 最近 100 个用户轮
+// 删除判决的观察期：一条记忆要先被看见这么多轮，才有资格被判「零回忆垃圾」。
+// 默认等于统计窗口；自检里用环境变量调小（否则要真跑 100 轮才测得到）。
+const JUDGE_TURNS = Math.max(1, Number(process.env.MEMORY_JUDGE_TURNS) || WINDOW_TURNS);
 const COMPRESS_EVERY = 100; // 每 100 轮触发一次压缩判定
 const HIGH_FREQ = 11; // 窗口内 >=11 次 = 高频，不送压缩
 // 记忆越多，删得越狠（2026-11-15 用户口径）：总量按对数增长，条目越多、淘汰线越紧。
@@ -51,6 +54,8 @@ const PID_KI = 0.05; // 慢速累积，纠长期偏差
 const PID_KD = 1.5; // 大一点：条目数骤变（合并/批量删）时立刻反应
 const PID_INTEGRAL_MAX = 0.6; // 抗积分饱和
 const PID_FILE = path.join(TIDY, 'pid.json'); // {turn, integral, prevErr, u, tier, total}
+const CONTROL_FILE = path.join(TIDY, 'control.json'); // {mode:'auto'|'manual', tier:1..6}
+const SEEN_FILE = path.join(TIDY, 'seen.json'); // {名称: 首次见到的轮次}——判「待删除」要先看够 100 轮
 
 function clampNum(x, lo, hi) {
   const n = Number(x);
@@ -87,19 +92,54 @@ function pidState(total) {
   const prevErr = Number.isFinite(st?.prevErr) ? st.prevErr : err;
   const uPrev = Number.isFinite(st?.u) ? st.u : clampNum(PID_KP * err, -1, 1);
   const lastTurn = Number.isFinite(st?.turn) ? st.turn : null;
-  if (lastTurn !== null && turnCount <= lastTurn) return { u: uPrev, tier: tierOf(uPrev), err };
+  if (lastTurn !== null && turnCount <= lastTurn) {
+    return { u: uPrev, tier: tierOf(uPrev), err, integral: integralPrev };
+  }
   const dt = lastTurn === null ? 1 : Math.max(1, turnCount - lastTurn);
   const integral = clampNum(integralPrev + PID_KI * err * dt, -PID_INTEGRAL_MAX, PID_INTEGRAL_MAX);
   const derivative = (err - prevErr) / dt;
   const u = clampNum(PID_KP * err + integral + PID_KD * derivative, -1, 1);
   const tier = tierOf(u);
   writeJson(PID_FILE, { turn: turnCount, integral, prevErr: err, u, tier, total: n });
-  return { u, tier, err };
+  return { u, tier, err, integral };
 }
 
-/** 当前该用第几套口径。 */
-function currentTier(total = readEntries().length) {
+/** 控制模式：auto = PID 推档；manual = 用户手选档位。缺省 auto。 */
+function readControl() {
+  const raw = readJson(CONTROL_FILE, null);
+  const mode = raw?.mode === 'manual' ? 'manual' : 'auto';
+  const tier = clampNum(Math.round(Number(raw?.tier) || 3), 1, 6);
+  return { mode, tier };
+}
+
+function writeControl(patch) {
+  const cur = readControl();
+  const asked = patch?.mode;
+  if (asked !== undefined && asked !== 'auto' && asked !== 'manual') {
+    throw new Error('mode 只能是 auto（PID 自动推挡）或 manual（手动锁档）');
+  }
+  const mode = asked === 'manual' ? 'manual' : asked === 'auto' ? 'auto' : cur.mode;
+  const rawTier = Number(patch?.tier);
+  const tier = Number.isFinite(rawTier) ? clampNum(Math.round(rawTier), 1, 6) : cur.tier;
+  const next = { mode, tier };
+  writeJson(CONTROL_FILE, next);
+  return next;
+}
+
+/** 只有 PID 算出来的档（手动模式下照样要算，切回自动才能接着用）。 */
+function autoTier(total = readEntries().length) {
   return pidState(total).tier;
+}
+
+/**
+ * 当前该用第几套口径：手动模式用用户选的档，自动模式用 PID。
+ * 手动模式也调一次 pidState——积分与导数照常按轮推进、照常落盘，
+ * 面板只是不显示 PID 卡片；切回自动时是「一直没停」，不是从头再来。
+ */
+function currentTier(total = readEntries().length) {
+  const ctl = readControl();
+  const auto = pidState(total);
+  return ctl.mode === 'manual' ? ctl.tier : auto.tier;
 }
 
 /** N 条时的淘汰窗口（天）：45 → 10，随条目数按 log2 递减，再按当前口径缩放。 */
@@ -167,6 +207,7 @@ const REJECT_FILE_ROUTE = '/dsh-memory/reject-file';
 const TOGGLE_ROUTE = '/dsh-memory/toggle';
 const PROTECT_ROUTE = '/dsh-memory/protect';
 const KEEP_ROUTE = '/dsh-memory/keep';
+const CONTROL_ROUTE = '/dsh-memory/control'; // 手动 / 自动切换（手动 = 自选档位）
 const PROMPTS_ROUTE = '/dsh-memory/prompts'; // 只读：把模型能看到的提示词原文全部交出来
 const CREATE_ROUTE = '/dsh-memory/create';
 const DELETE_ROUTE = '/dsh-memory/delete';
@@ -338,11 +379,52 @@ function lessonEntries() {
   }
 }
 
-function lessonHooksLine(max = 8) {
-  const parts = lessonEntries()
+/**
+ * 动手前提醒里那串「名称=关键词」。
+ *
+ * 2026-11-25 的现场：`plugin-release-versioning`（教训/更新作品/推仓库/版本管理）当天新建，
+ * 是老顺序里的第 21 条，`max = 8` 直接把它截掉，于是推 GitHub 时提醒里根本没有它。
+ * 「只给前 8 条」等于把最新、最贴近当下任务的那些教训藏起来——所以改成：
+ * ① 先按「跟这次动作的字面重合」排序（命令里出现 `push` 就浮出「推仓库」这类钩子）；
+ * ② 再补上其余条目，整体上限 24 条、每段最多保留 2 个关键词段，避免提醒本身变成噪音。
+ */
+/**
+ * 动作 ↔ 关键词的对齐表：中文钩子对不上英文命令（`推仓库` 遇上 `git push` 永远匹配不上），
+ * 所以命令里出现哪些英文动词，就把对应语义的钩子加权。规则很少，改这里就够。
+ */
+const HINT_ALIASES = [
+  { when: /\b(push|release|tag|publish)\b/, segs: /推仓库|发版|版本|release|发版/i },
+  { when: /\b(remove-item|rmdir|del|rm|clean|uninstall)\b/, segs: /删|清理|破坏性|卸载/i },
+  { when: /\b(install|pnpm\s+add|plugin)\b/, segs: /装|安装|插件|bundle/i },
+  { when: /\b(write|edit|patch|create)\b/, segs: /改|写|补丁|记录/i },
+  { when: /\b(restart|boot|profile|cordis)\b/, segs: /重启|profile|配置|dist/i },
+];
+
+function lessonHooksLine(max = 24, hint = '') {
+  const list = lessonEntries();
+  if (!list.length) return '';
+  const signal = String(hint || '').toLowerCase();
+  const alias = HINT_ALIASES.filter((r) => r.when.test(signal)).map((r) => r.segs);
+  const scoreOf = (e) => {
+    if (!signal) return 0;
+    const body = String(e.keywords || '').split('/').slice(1);
+    const literal = body.reduce(
+      (n, seg) => (seg && signal.includes(String(seg).toLowerCase().replace(/\s+/g, '')) ? n + 1 : n),
+      0,
+    );
+    // 语义命中只算一次加权，避免一条记忆因为多个别名段被重复抬高。
+    const semantic = alias.some((re) => re.test(String(e.keywords || ''))) ? 2 : 0;
+    return literal + semantic;
+  };
+  const scored = list.map((e, i) => ({ e, i, score: scoreOf(e) }));
+  scored.sort((a, b) => b.score - a.score || a.i - b.i);
+  return scored
     .slice(0, max)
-    .map((e) => `${e.file.replace(/\.md$/i, '')}=${String(e.keywords || '').split('/').slice(1).join('/') || '（无关键词）'}`);
-  return parts.join(' · ');
+    .map(({ e }) => {
+      const segs = String(e.keywords || '').split('/').slice(1).filter(Boolean).slice(0, 2);
+      return `${e.file.replace(/\.md$/i, '')}=${segs.join('/') || '（无关键词）'}`;
+    })
+    .join(' · ');
 }
 
 function lessonReadThisTurn() {
@@ -353,8 +435,8 @@ function lessonReadThisTurn() {
   return (Array.isArray(events) ? events : []).some((ev) => ev && ev.turn === turn && files.has(ev.file));
 }
 
-function lessonReminder() {
-  const line = lessonHooksLine();
+function lessonReminder(hint = '') {
+  const line = lessonHooksLine(24, hint);
   if (!line) return '';
   return `【教训提醒】动手前扫一眼，命中就先 memory_read（可一次传多条）再动手：${line}`;
 }
@@ -1565,7 +1647,8 @@ function compressPlan() {
   const hits = recallHits();
   const plan = [];
   const all = readEntries();
-  // 淘汰线随条目数收紧：条目越多，同样的「零回忆 + 老」越容易归入重压档。
+  // 压缩只做改写，不做删除判决：该不该删由 snapshot() 里的脚本按「看够 100 轮 + 零回忆」算，
+  // 压缩流水的分档只决定「改多重」。条目越多，同样的零回忆越容易落进重压档。
   const staleDays = pruneDays(all.length);
   for (const entry of all) {
     if (!entry.enabled || entry.protected) continue;
@@ -1574,7 +1657,6 @@ function compressPlan() {
     const body = readMemoryBody(entry.file);
     let level;
     if (count >= HIGH_FREQ) level = 'skip-high';
-    else if (count === 0 && Number.isFinite(age) && age >= staleDays) level = 'stale';
     else if (count === 0) level = 'heavy';
     else if (count === 1 && Number.isFinite(age) && age >= staleDays) level = 'heavy';
     else level = 'light';
@@ -1826,13 +1908,8 @@ async function runCompress(reason) {
     const pending = new Set(proposedFiles());
     const light = [];
     const heavy = [];
-    const stale = [];
     for (const item of plan) {
       if (item.level === 'skip-high') continue;
-      if (item.level === 'stale') {
-        stale.push(item.file);
-        continue;
-      }
       if (pending.has(item.file)) continue; // 已经有待审改稿，别重复提
       if (Array.from(item.body || '').length < 120) continue;
       (item.level === 'light' ? light : heavy).push(item);
@@ -1845,9 +1922,9 @@ async function runCompress(reason) {
         stage: 'done',
         reason,
         files: [],
-        detail: stale.length ? `${stale.length} 份报备待删除，没有要送的记忆` : '没有需要压缩的记忆',
+        detail: '没有需要压缩的记忆',
       });
-      return { files: [], stale };
+      return { files: [] };
     }
     const key = apiKey();
     if (!key) throw new Error('缺少 DSH_AUTOMATION_API_KEY，请在 ~/.dsh/automation.env 里配置');
@@ -1916,13 +1993,12 @@ async function runCompress(reason) {
         `${written.length} 份改稿待审批${belowTarget ? `（${belowTarget} 份未达目标比例）` : ''}`,
         unchanged ? `${unchanged} 份原文未动已跳过` : '',
         nearNoop ? `${nearNoop} 份几乎未缩短已跳过` : '',
-        stale.length ? `${stale.length} 份报备待删除` : '',
         failures.length ? `${failures.length} 批请求失败：${failures[0]}` : '',
       ]
         .filter(Boolean)
         .join('，'),
     });
-    return { files: written, stale, failures };
+    return { files: written, failures };
   } catch (err) {
     writeJson(COMPRESS, {
       startedAt,
@@ -2326,16 +2402,30 @@ function snapshot() {
     days: pruneDays(entries.length, tier),
     minHits: pruneMinHits(entries.length, tier),
     tier,
+    window: WINDOW_TURNS,
   };
+  // 删除判决要等这条记忆「被看过一整个窗口」：新条目还没轮到被读，不能当零回忆垃圾。
+  const seen = noteSeen(entries);
   const linkMap = readLinks();
   for (const e of entries) {
     const hits = rates.get(e.file);
     e.recallRate = windowSize ? hits || 0 : null;
     e.links = Object.keys(linkMap[stemOf(e.file)] || {}).length;
     const reviewedAge = daysSince(e.reviewed);
-    // 待删除 = 窗口内回忆次数低于当前门槛 + 复核日超过当前淘汰窗口；锁定的、停用的不参与。
+    const firstTurn = seen[stemOf(e.file)];
+    const ageTurns = Number.isFinite(firstTurn) ? Math.max(0, turnCount - firstTurn) : null;
+    e.ageTurns = ageTurns;
+    // 待删除 = 窗口已满 + 这条已看够 100 轮 + 回忆次数低于门槛 + 复核日超出淘汰窗口；
+    // 锁定的、停用的不参与。判决纯脚本算，模型不参与、压缩流水线也不碰。
     e.pendingDelete = Boolean(
-      windowSize && (hits || 0) < prune.minHits && Number.isFinite(reviewedAge) && reviewedAge >= prune.days && e.enabled && !e.protected,
+      windowSize >= JUDGE_TURNS &&
+        Number.isFinite(ageTurns) &&
+        ageTurns >= JUDGE_TURNS &&
+        (hits || 0) < prune.minHits &&
+        Number.isFinite(reviewedAge) &&
+        reviewedAge >= prune.days &&
+        e.enabled &&
+        !e.protected,
     );
   }
 
@@ -2364,6 +2454,22 @@ function snapshot() {
     turns: turnCount,
     windowTurns: windowSize,
     recall: recallOverview(),
+    // 口径控制：手动 / 自动。手动时 pid 照样在后台算，切回自动即接着用。
+    control: (() => {
+      const ctl = readControl();
+      const pid = pidState(entries.length);
+      return {
+        mode: ctl.mode,
+        manualTier: ctl.tier,
+        autoTier: pid.tier,
+        activeTier: ctl.mode === 'manual' ? ctl.tier : pid.tier,
+        u: Number(pid.u.toFixed(3)),
+        err: Number(pid.err.toFixed(3)),
+        integral: Number(pid.integral.toFixed(3)),
+        target: MEM_TARGET,
+        total: entries.length,
+      };
+    })(),
     // 当前淘汰线：条目越多，days 越小、minHits 越大（面板照这个解释「为什么这条被标待删除」）。
     prune,
     compress: {
@@ -2385,6 +2491,33 @@ function snapshot() {
     outline: outlineText(entries),
     entries,
   };
+}
+
+/**
+ * 记住每条记忆「第一次被看见」的轮次。删除判决要求一条记忆先走完一整个统计窗口
+ * （`WINDOW_TURNS`）才有资格被判零回忆——不然刚建的条目连被读的机会都没有。
+ * 只记名字不记内容；条目被删掉时顺手清掉，免得同名新建被当成老条目。
+ */
+function noteSeen(entries) {
+  const seen = readJson(SEEN_FILE, {}) || {};
+  const stems = new Set(entries.map((e) => stemOf(e.file)));
+  let dirty = false;
+  for (const stem of stems) {
+    if (!Number.isFinite(seen[stem])) {
+      seen[stem] = turnCount;
+      dirty = true;
+    }
+  }
+  // 只在索引确实读到条目时才清理：读到空表可能是别的东西正写到一半，
+  // 这时候把所有首次见到时间抹掉，等于让全部条目重新进入观察期。
+  for (const stem of entries.length ? Object.keys(seen) : []) {
+    if (!stems.has(stem)) {
+      delete seen[stem];
+      dirty = true;
+    }
+  }
+  if (dirty) writeJson(SEEN_FILE, seen);
+  return seen;
 }
 
 function statusLine() {
@@ -2897,7 +3030,14 @@ export function apply(ctx) {
         const extra = [];
         // 动手前提醒：写 / 跑 / 装删之前把【教训】钩子递一次（每轮最多一条，已读过教训就不打扰）。
         if (REMIND_TOOLS.has(exec.name) && lastRemindTurn !== turnCount && !lessonReadThisTurn()) {
-          const text = lessonReminder();
+          // 把这次动作的字面（命令 / 路径 / 参数）当提示词，让相关的教训钩子浮到最前面。
+          let hint = '';
+          try {
+            hint = `${exec.name || ''} ${JSON.stringify(exec.arguments || {})}`;
+          } catch {
+            hint = String(exec.name || '');
+          }
+          const text = lessonReminder(hint);
           if (text) {
             lastRemindTurn = turnCount;
             extra.push({ type: 'text', text });
@@ -3033,6 +3173,22 @@ export function apply(ctx) {
               const body = JSON.parse(await readBody(req));
               const kept = keepEntry(String(body.file || ''));
               sendJson(res, 200, { ...snapshot(), kept });
+            } catch (err) {
+              sendJson(res, 400, { error: err.message });
+            }
+          },
+        }),
+        webCtx.webServer.register({
+          kind: 'exact',
+          path: CONTROL_ROUTE,
+          handler: async (req, res) => {
+            if (req.method !== 'POST') return sendJson(res, 405, { error: 'method' });
+            try {
+              const body = JSON.parse(await readBody(req));
+              const control = writeControl({ mode: body.mode, tier: body.tier });
+              // 只取一次快照：snapshot() 要读索引、全量正文和几个 json，调两次既浪费也可能前后不一致。
+              const snap = snapshot();
+              sendJson(res, 200, { ...snap, control: { ...snap.control, ...control } });
             } catch (err) {
               sendJson(res, 400, { error: err.message });
             }
@@ -3236,6 +3392,10 @@ export const __test = {
   parseCompressItems,
   COMPRESS_MAX_TOKENS,
   COMPRESS_MAX_TOKENS_CAP,
+  TIER_LINES,
+  readControl,
+  writeControl,
+  JUDGE_TURNS,
   decodeSessionLog,
   sessionLogPath,
   renderSessionTranscript,

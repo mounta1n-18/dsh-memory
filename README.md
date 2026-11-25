@@ -77,7 +77,12 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
   静态成本约 2.4K token/请求（大纲三段 + 五个工具声明 = 3534 字，见 `PROMPTS.md`），不随记忆条数线性涨（单条关键词有裁剪上限）。
 - `memory:tidy-status`（order 9900）：正常时零输出，异常才一行「待审批 N 份 / 上次失败：原因」。
 
-**动手前提醒（2026-11-14 新增）**：光靠索引常驻不够——模型动手那一刻经常不回头看大纲。所以 `tools/post-execute` 里盯着本轮**第一次** `write / edit / pwsh / computer_use / memory_delete / memory_update`，在工具结果后面追加一段 text block：`【教训提醒】动手前扫一眼…：noahs-ark=删家目录/重装DSH · …`（`lessonHooksLine()`，最多 8 条）。同一轮只提醒一次（`lastRemindTurn`），该轮已经用 `memory_read` 读过任何教训就闭嘴（`lessonReadThisTurn()` 查 `recall.json` 当前轮）。这是**场景触发**：成本约 100 token/轮且只在真要动手时出现。
+**动手前提醒（2026-11-14 新增，2026-11-25 扩容并按动作排序）**：光靠索引常驻不够——模型动手那一刻经常不回头看大纲。所以 `tools/post-execute` 里盯着本轮**第一次** `write / edit / pwsh / computer_use / memory_delete / memory_update`，在工具结果后面追加一段 text block：`【教训提醒】动手前扫一眼…：noahs-ark=删家目录/重装DSH · …`。同一轮只提醒一次（`lastRemindTurn`），该轮已经用 `memory_read` 读过任何教训就闭嘴（`lessonReadThisTurn()` 查 `recall.json` 当前轮）。这是**场景触发**：成本随教训条数变化，只在真要动手时出现。
+
+两处细节：
+
+- **上限从 8 条放宽到 24 条，并按当前动作排序**（`lessonHooksLine(24, hint)`）。旧版只列前 8 条，2026-11-25 那天新建的 `plugin-release-versioning` 正好是第 21 条，于是推 GitHub 时提醒里根本没有发版钩子——这是「机制把最新教训藏起来」，不是模型单方面的注意力问题。排序规则：`hint = 工具名 + JSON 参数`，与关键词段字面重合的加分，同分保持原顺序，每条只保留 2 个关键词段。
+- **中文钩子对英文命令**（`HINT_ALIASES`）：关键词是中文（`推仓库`/`删家目录`），命令是英文（`git push`/`Remove-Item`），字面永远对不上。所以维护了一张很小的动作对齐表——命令里出现 `push / release / tag` 就把「推仓库|发版|版本」类钩子加权 +2，`Remove-Item / rm / del` 对「删|清理|破坏性|卸载」，`install / plugin` 对「装|安装|插件」，`write / edit / patch` 对「改|写」，`restart / profile / dist` 对「重启|配置」。加规则只改这张表。
 
 **破坏性命令硬闸门（2026-11-15 加，2026-11-25 撤）**：曾经在 `tools/pre-execute` 里匹配 `Remove-Item`、`rmdir`、`del /f`、`git reset --hard`、`Stop-Process` 等命令，没读过教训就 deny 一次。**现已移除**：判断权交回模型，只保留上面那条「动手前提醒」。理由是硬拦会误伤日常命令，也把「该不该读」变成机械反应；实测提醒 + 查重闸门已经把教训回忆率从 6% 拉到 30% 上下。
 
@@ -112,6 +117,10 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
 | 6 | 记忆已经很挤：一律改写或并入，能删就删 | ×0.6 | +2 |
 
 当前套数写进 `.tidy/pid.json`，其那句话作为大纲第 3 行每轮下发；`pruneDays()` / `pruneMinHits()` 再按套数缩放（窗口夹在 7~60 天），所以「该记的时候记得住、该收的时候收得动」是同一套量在驱动。
+
+**自动 / 手动混合控制（2026-11-25 新增）**：控制方式存在 `.tidy/control.json`（`{ mode: 'auto' | 'manual', tier: 1..6 }`），面板顶部「提示词口径」那块右侧的两段控件随时切，接口是 `POST /dsh-memory/control`（`{mode, tier}`，非法 mode 回 400、tier 夹到 1~6）。两种模式的差别只有「用哪个档」，PID 本身**两种模式下都照常算**：`pidState()` 每轮推进积分与导数并落盘，所以切到手动、过一阵再切回自动，积分是接着走的，不会从头再来。手动模式下面板不再显示 PID 卡片，改为整行的「手动档位」面板（六张卡片，点哪张锁哪张）；PID 的结论仍以 `autoTier / u / err` 留在 `/dsh-memory/status` 的 `control` 字段里，面板用一句提示说明「PID 在后台仍算：自动本会取第 N 档」。
+
+**删除判决：脚本算，不问模型（2026-11-25 改）**：以前压缩流水线会给模型一档「过时」，由模型提议清理——新条目还没攒够回忆就被当垃圾，这不合理。现在**压缩只管改写、不再碰删除**（`compressPlan()` 只剩 `skip-high` / `heavy` / `light` 三档），删除判决完全由 `snapshot()` 里的脚本条件决定，且带观察期：`windowSize >= JUDGE_TURNS`（默认等于 `WINDOW_TURNS`，即观察窗口满 100 轮）**且** `ageTurns >= JUDGE_TURNS`（这条第一次被看见到现在够 100 轮）才可能被判待删除。`ageTurns` 由 `.tidy/seen.json`（`{名称: 首次见到的轮次}`，`noteSeen()` 每轮补齐/清理）算出；自检用 `MEMORY_JUDGE_TURNS=1` 把观察期压小来测这条边界。
 
 **提示词检视（`/dsh-memory/prompts`）**：把模型在整个记忆流程里能看到的提示词原文一次交出来——大纲、五个工具声明（注册时由 `toolSink` 顺手抄录，不手抄、不漂移）、动手前提醒、两道拦截的拒绝理由、各校验器的报错原文、`/remember` 的隐藏指令。`PROMPTS.md` 是它的落地版：`$env:DUMP_PROMPTS="PROMPTS.md"; node tools/selfcheck.mjs` 重新生成。
 
@@ -163,7 +172,7 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
 
 `tools/post-execute` 对写进 `body` 的文件做 2000 字软提示：只提示，写入已生效；措辞刻意放轻，说重了模型会为缩字数丢信息。
 
-**十七条路由**：`GET /dsh-memory/status`（兼 `?client=1` 心跳）、`GET /dsh-memory/calls`（按会话列记忆调用）、`GET /dsh-memory/prompts`（提示词检视）与 `POST keyword / open / approve-file / reject-file / toggle / protect / keep / create / delete / search / compress / remember / dockping`。
+**十八条路由**：`GET /dsh-memory/status`（兼 `?client=1` 心跳）、`GET /dsh-memory/calls`（按会话列记忆调用）、`GET /dsh-memory/prompts`（提示词检视）与 `POST keyword / open / approve-file / reject-file / toggle / protect / keep / control / create / delete / search / compress / remember / dockping`。
 
 **记忆调用流水**：`tools/post-execute` 里记下每次 `memory_*` 调用（会话 id、轮、读/写/改/删、目标、关键词、字数，最多 400 条）到 `.tidy/calls.json`，供对话界面的「记忆」标签页显示；不进上下文、不写会话历史。
 
@@ -221,7 +230,7 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
 
 ## 工具（`tools/`）
 
-- `selfcheck.mjs`：mock 一个 cordis ctx 把 `apply()` 整条路径跑起来（临时 `DSH_HOME`，不碰真实记忆库），覆盖装载面、大纲（含冷热分层）、关系边、status、分类约束、回忆统计、新建/删除、搜索、压缩、/remember、调用流水、保留与动手前提醒、查重（模型自己判断）/并条目/空泛词/淘汰线、总量口径、提示词检视、压缩结构化输出、客户端配色不回潮、项目记忆来源会话与原文备份共 296 项。**改完先跑它，再考虑重启**：`node tools/selfcheck.mjs`。
+- `selfcheck.mjs`：mock 一个 cordis ctx 把 `apply()` 整条路径跑起来（临时 `DSH_HOME`，不碰真实记忆库），覆盖装载面、大纲（含冷热分层）、关系边、status、分类约束、回忆统计、新建/删除、搜索、压缩、/remember、调用流水、保留与动手前提醒、查重（模型自己判断）/并条目/空泛词/淘汰线、总量口径、提示词检视、压缩结构化输出、客户端配色不回潮、项目记忆来源会话与原文备份共 314 项。**改完先跑它，再考虑重启**：`node tools/selfcheck.mjs`。
 - `tidy.mjs` + `run.cmd`：旧的「整理」worker，**已不再挂计划任务**（压缩不是定时任务）。保留作手动兜底：`node tools/tidy.mjs [--dry-run|--if-due]`，只写 `proposed/` 与 `status.json`。
 
 ## 未完成

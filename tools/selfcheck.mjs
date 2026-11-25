@@ -100,6 +100,8 @@ function buildRepo() {
 
 buildRepo();
 process.env.DSH_HOME = HOME;
+// 待删除判决的观察期默认 100 轮；自检里把观察期压到 1 轮，才能测到「刚被看见的条目不算待删除」。
+process.env.MEMORY_JUDGE_TURNS = '1';
 
 /** /remember 用的假转录：两条人类消息 + 一条助手消息 + 一条子代理消息（后者应被排除）。 */
 const FAKE_EVENTS = [
@@ -271,7 +273,7 @@ console.log(`\n[1] 装载面  DSH_HOME=${HOME}`);
 eq('两段系统提示注入', state.sections.length, 2);
 ok('注入顺序 outline < tidy-status', state.sections[0].name === 'memory:outline' && state.sections[1].name === 'memory:tidy-status');
 eq('五个模型工具', [...state.tools.keys()].sort().join(','), 'memory_delete,memory_read,memory_source,memory_update,memory_write');
-eq('十七条路由（含 /remember、保留、提示词检视、调用流水/详情与探针）', state.routes.size, 17);
+eq('十八条路由（含 /remember、保留、口径控制、提示词检视、调用流水/详情与探针）', state.routes.size, 18);
 
 console.log('\n[2] 大纲不丢条目');
 const outline = state.sections[0].text();
@@ -1051,7 +1053,7 @@ console.log('\n[15] 保留（否决待删除）与动手前提醒');
 {
   const s = await call(state, '/dsh-memory/status');
   const stale = s.body.entries.find((e) => e.pendingDelete);
-  ok('夹具里有「待删除」条目（否则这条测不到）', Boolean(stale), s.body.entries.map((e) => `${e.file}:${e.pendingDelete}`).join(','));
+  ok('夹具里有「待删除」条目（否则这条测不到）', Boolean(stale), `prune=${JSON.stringify(s.body.prune)} 判据=${JSON.stringify(s.body.control)} ` + s.body.entries.map((e) => `${e.file}:${e.pendingDelete}:age=${e.ageTurns}`).join(','));
   if (stale) {
     eq('待删除条目的回忆率是 0', stale.recallRate, 0);
     const kept = await call(state, '/dsh-memory/keep', { file: stale.file });
@@ -1341,6 +1343,58 @@ console.log('\n[20] 关系边与大纲冷热分层');
   ok('冷条目被削短', kwLen('huashu-motion-install') < kwLen('pl-mem') && kwLen('huashu-motion-install') <= T.OUTLINE_COLD_KW_MAX + 8, `${kwLen('huashu-motion-install')} 字 / ${seg('huashu-motion-install')}`);
   ok('削短后名字还在大纲里', seg('huashu-motion-install').startsWith('huashu-motion-install='));
   ok('削短的条目以省略号结尾（在关键词边界剪）', /…$/.test(seg('huashu-motion-install')), seg('huashu-motion-install'));
+}
+
+console.log('\n[21] 口径的自动/手动混合控制与删除判决的观察期');
+{
+  const first = await call(state, '/dsh-memory/status');
+  const ctl0 = first.body.control;
+  ok('状态里带控制方式', Boolean(ctl0) && ['auto', 'manual'].includes(ctl0.mode), JSON.stringify(ctl0));
+  eq('默认是自动', ctl0.mode, 'auto');
+  ok('自动档位与 prune.tier 一致', ctl0.activeTier === first.body.prune.tier, `${ctl0.activeTier} / ${first.body.prune.tier}`);
+
+  const locked = await call(state, '/dsh-memory/control', { mode: 'manual', tier: 5 });
+  eq('切手动 200', locked.code, 200);
+  eq('回包是手动', locked.body.control.mode, 'manual');
+  eq('手动档位生效', locked.body.control.activeTier, 5);
+  eq('手动档位同时压到 prune.tier', locked.body.prune.tier, 5);
+  ok('手动时仍给出自动档位（PID 后台照算）', Number.isFinite(locked.body.control.autoTier), JSON.stringify(locked.body.control));
+
+  const clamped = await call(state, '/dsh-memory/control', { mode: 'manual', tier: 99 });
+  eq('档位超范围被夹到 6', clamped.body.control.activeTier, 6);
+  const bad = await call(state, '/dsh-memory/control', { mode: 'weird', tier: 2 });
+  eq('非法 mode 被拒 400', bad.code, 400);
+
+  const manual = await call(state, '/dsh-memory/control', { mode: 'manual', tier: 2 });
+  eq('再切回手动第 2 档', manual.body.control.activeTier, 2);
+  ok('手动档位会写进大纲（模型看到第 2 档那句口径）', T.outlineText().includes(T.TIER_LINES[1]), T.TIER_LINES[1]);
+
+  const auto = await call(state, '/dsh-memory/control', { mode: 'auto' });
+  eq('切回自动', auto.body.control.mode, 'auto');
+  eq('自动档位由 PID 决定', auto.body.control.activeTier, auto.body.control.autoTier);
+
+  // 删除判决：观察期内的新条目一律不判（哪怕复核日很旧、回忆 0 次）。
+  userTurn();
+  const fresh = write.execute({
+    name: 'judge-fresh',
+    keywords: '说明书/判决观察期/自检',
+    description: '自检：观察期',
+    body: '观察期自检。',
+    dup_check: '只比了关键词，没有讲判决观察期的条目，判成新建',
+  });
+  ok('观察期内条目能正常新建', /已记下/.test(fresh.text), fresh.text.slice(0, 40));
+  const st = await call(state, '/dsh-memory/status');
+  const me = st.body.entries.find((e) => e.file === 'judge-fresh.md');
+  ok('新条目 ageTurns 是 0', me && me.ageTurns === 0, JSON.stringify(me && me.ageTurns));
+  ok('观察期没走完就不判待删除', me && me.pendingDelete === false, `${me && me.pendingDelete}`);
+  state.tools.get('memory_delete').execute({ name: 'judge-fresh' });
+
+  // 语义对齐：中文钩子（删除/清理）也要能被英文命令（Remove-Item）顶到提醒最前面。
+  userTurn();
+  const danger = await afterTool(state, 'pwsh', { command: 'Remove-Item build -Recurse -Force' });
+  const dangerText = (danger.content || []).map((b) => String(b.text || '')).join('');
+  const order = dangerText.split('：')[1] || '';
+  ok('破坏性命令把「删/清理」类教训顶到最前', order.startsWith('tmp-act='), order.slice(0, 90));
 }
 
 if (process.env.DUMP_PROMPTS) {
