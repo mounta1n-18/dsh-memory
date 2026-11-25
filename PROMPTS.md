@@ -1,33 +1,33 @@
 # 记忆插件：模型能看到的全部提示词
 
 > 自动生成，别手改：`$env:DUMP_PROMPTS="<文件>" ; node tools/selfcheck.mjs`
-> 当次口径：第 2 套 / 条目 28 条 / 目标 50 条。
+> 当次口径：第 1 套 / 条目 28 条 / 目标 50 条。
 
-全部原文合计 **6048** 字。记忆正文不在其中（那是数据，不是提示词）。
+全部原文合计 **5916** 字。记忆正文不在其中（那是数据，不是提示词）。
 
 ## 每次请求都发的部分
 
-这 6 段合计 **3117** 字。
+这 7 段合计 **3534** 字。
 
-### 系统提示词·大纲抬头（162 字）
+### 系统提示词·大纲抬头（167 字）
 
 触发时机：系统提示词·记忆索引（每轮都在）
 
 ```text
 记忆索引（名称=关键词）。关键词是钩子，写的是「什么场景下必须点开这条」。读正文用 memory_read，可一次传多个（file:"a、b"）。
 动手改 / 删 / 装 / 跑命令之前，先扫【教训】；提到旧事或接手旧任务，扫对应分组；拿不准就查——查错一次调用，漏查要返工。
-新主题优先开一条；跟旧条目只是沾边，就别合并。
+记的时候大方点：碰到新主题直接开一条，别硬塞进旧条目里。
 ```
 
-### 系统提示词·大纲分组（722 字）
+### 系统提示词·大纲分组（679 字）
 
 触发时机：系统提示词·记忆索引（每轮都在）
 
 ```text
-【教训】noahs-ark=诺亚方舟/恢复 · tmp-check=自检 · tmp-act=批量删除家目录/清理缓存目录
+【教训】noahs-ark=诺亚方舟/恢复 · tmp-check=自检 · tmp-act=批量删除家目录…
 【资料】user-profile=身份/张三/生日/学号/身高 · girlfriend-profile=女友/李四 · random-signal-review=随机信号分析/期末复习 · tmp-new=自检/新建 · dup-f=另一种咖啡/自检
-【说明书】pl-btw=btw/旁路问答 · pl-ctx=上下文/用量 · pl-mcp=MCP/懒加载 · pl-mem=记忆/索引/dsh-memory/大纲/整理/压缩/回忆率/待删除/审批… · pl-perm=权限/预设 · pl-mcd=麦当劳/MCP · pl-teach=教学/预设 · huashu-motion-install=huashu-motion/花叔/宣传片/om CLI/动效片/安装位置 · dup-e=查重基准/自检 · dup-h=查重基准/自检
-【项目记忆】dsh-memory=dsh-memory/压缩/闸门 · dsh-memory-2=dsh-memory/压缩/闸门 · wild=资料/随便 · ctx-agent=ctx-agent/上下文 · fallback-agent=fallback-agent/兜底 · retry-tool=retry-tool · http-fallback=http-fallback · tmp-src=自检来源
+【说明书】pl-btw=btw/旁路问答 · pl-ctx=上下文/用量 · pl-mcp=MCP/懒加载 · pl-mem=记忆/索引/dsh-memory/大纲/整理/压缩/回忆率/待删除/审批… · pl-perm=权限/预设 · pl-mcd=麦当劳/MCP · pl-teach=教学/预设 · huashu-motion-install=huashu-motion… · dup-e=查重基准/自检 · dup-h=查重基准/自检
+【项目记忆】dsh-memory=dsh-memory… · dsh-memory-2=dsh-memory… · wild=资料/随便 · ctx-agent=ctx-agent… · fallback-agent=fallback-agent… · retry-tool=retry-tool · http-fallback=http-fallback · tmp-src=自检来源
 【其它】len-short=短正文静默 · len-long=长正文提示
 【教训】的钩子写的是「会闯祸的场面」：命中就先 memory_read 读完，再动手。
 ```
@@ -104,15 +104,6 @@
 【教训提醒】动手前扫一眼，命中就先 memory_read（可一次传多条）再动手：noahs-ark=诺亚方舟/恢复 · tmp-check=自检 · tmp-act=批量删除家目录/清理缓存目录
 ```
 
-### 拦截·破坏性命令（83 字）
-
-触发时机：pwsh 命中危险命令且本轮还没读教训时
-
-```text
-这条命令是破坏性的，先看一眼教训再跑——这一轮你还没读任何【教训】：{hooks}。
-用 memory_read 读完相关的那条（可一次传多条），再原样重试这条命令。
-```
-
 ### 拦截·翻记忆目录（51 字）
 
 触发时机：read/grep/glob 指向记忆仓库时
@@ -121,7 +112,7 @@
 记忆正文要用 memory_read 工具读：先在大纲里挑名称或关键词，再调用它，不要直接翻仓库文件。
 ```
 
-### 校验·按需触发（950 字）
+### 校验·按需触发（939 字）
 
 触发时机：写入/改写被拒时的报错原文
 
@@ -142,7 +133,7 @@
 
 ［查重太短］查重结论太短了（2 字）：「无关」。写清你比了哪些条目、判成相似/相同/相关/无关、所以新建还是并入，至少 10 个字。
 
-［查重没判定词］你这一轮读过 noahs-ark、tmp-src，dup_check 里却没提它：先说清跟它是什么关系再落盘——相似就 memory_update 改它、相关就 append:true 并进去、无关就写明「无关」的理由。别读到了还另开一条。
+［查重没判定词］你这一轮读过 pl-mem，dup_check 里却没提它：先说清跟它是什么关系再落盘——相似就 memory_update 改它、相关就 append:true 并进去、无关就写明「无关」的理由。别读到了还另开一条。
 ```
 
 ### /remember·隐藏指令（1067 字）

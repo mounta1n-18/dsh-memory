@@ -1184,20 +1184,20 @@ console.log('\n[16] 新建前查重（模型自己判断）/ 并进已有条目 
   const ids = (inv.body?.items || []).map((it) => it.id);
   ok('提示词接口可用', inv.code === 200 && ids.length >= 8, `${inv.code} / ${ids.length} 段`);
   ok('含大纲抬头与工具定义', ids.includes('系统提示词·大纲抬头') && ids.includes('工具·memory_read') && ids.includes('工具·memory_write'), ids.join(' | ').slice(0, 120));
-  ok('含拦截与提醒原文', ids.includes('拦截·破坏性命令') && ids.includes('工具·动手前提醒'), ids.join(' | ').slice(0, 120));
+  ok('含提醒原文', ids.includes('工具·动手前提醒'), ids.join(' | ').slice(0, 120));
   const wt = (inv.body?.items || []).find((it) => it.id === '工具·memory_write');
   ok('工具定义里带参数说明', /参数：/.test(wt?.text || '') && /dup_check/.test(wt?.text || ''), String(wt?.text || '').slice(0, 60));
   ok('口径总字数可统计', Number.isFinite(inv.body?.totalChars) && inv.body.totalChars > 1000, String(inv.body?.totalChars));
   const outlineNow = (inv.body?.items || []).find((it) => it.id === '系统提示词·大纲抬头')?.text || '';
   ok('大纲里有当前口径那一句', /记的时候大方点|新主题优先|先看看现成的|优先改写|少一条胜过|记忆已经很挤/.test(outlineNow), outlineNow.slice(0, 80));
 
-  // 破坏性命令的硬闸门：这一轮没读教训就拒一次，读过之后放行。
+  // 硬闸门已关（2026-11-25 用户要求）：破坏性命令不再被 deny，只留 post-execute 的动手前提醒。
   userTurn();
-  eq('没读教训时删目录被拦', await gate(state, 'pwsh', { command: 'Remove-Item -Recurse -Force C:\\tmp\\foo' }), 'deny');
-  eq('没读教训时 git reset --hard 被拦', await gate(state, 'pwsh', { command: 'git reset --hard HEAD~1' }), 'deny');
-  eq('普通命令不受影响', await gate(state, 'pwsh', { command: 'git status --short' }), 'pass');
-  read.execute({ file: 'noahs-ark' });
-  eq('读过教训后破坏性命令放行', await gate(state, 'pwsh', { command: 'Remove-Item -Recurse -Force C:\\tmp\\foo' }), 'pass');
+  eq('破坏性命令不再被拦', await gate(state, 'pwsh', { command: 'Remove-Item -Recurse -Force C:\\tmp\\foo' }), 'pass');
+  eq('git reset --hard 也不再被拦', await gate(state, 'pwsh', { command: 'git reset --hard HEAD~1' }), 'pass');
+  eq('普通命令照旧放行', await gate(state, 'pwsh', { command: 'git status --short' }), 'pass');
+  const invIds = (await call(state, '/dsh-memory/prompts')).body?.items?.map((it) => it.id) || [];
+  ok('提示词检视里不再有硬闸门话术', !invIds.includes('拦截·破坏性命令'), invIds.join(' | ').slice(0, 120));
 }
 
 console.log('\n[17] 压缩请求的结构化输出（工具调用 + 预算 + 回包解析）');
@@ -1306,7 +1306,43 @@ console.log('\n[19] 项目记忆的来源会话与原始上下文备份');
   ok('没有来源会话的记忆被拒', /没有来源会话/.test(noSource), noSource);
 }
 
-// 需要一份「模型能看到的全部提示词」时：DUMP_PROMPTS=<文件.md> node tools/selfcheck.mjs
+console.log('\n[20] 关系边与大纲冷热分层');
+{
+  // 关系边：dup_check 里点名、且判成相似/相关/并入的条目，会连成一条双向边。
+  userTurn();
+  read.execute({ file: 'pl-mem' });
+  const linked = write.execute({
+    name: 'rel-new',
+    keywords: '说明书/关系边/自检',
+    description: '自检：关系边',
+    body: '关系边自检正文。',
+    dup_check: '跟 pl-mem 都涉及记忆索引，读了全文发现它是工具说明、这条是链路自检，判成相关',
+  });
+  ok('带关系结论的写入成功', /已记下/.test(linked.text), linked.text.slice(0, 60));
+  const rel = T.relatedOf('pl-mem.md').map((r) => r.file);
+  ok('新条目与原条目连成边', rel.includes('rel-new.md'), rel.join(','));
+  const back = T.relatedOf('rel-new.md').map((r) => r.file);
+  ok('边是双向的', back.includes('pl-mem.md'), back.join(','));
+  const readBack = read.execute({ file: 'rel-new' });
+  ok('读一条时顺带提示邻居', /相关记忆：/.test(readBack.text) && /pl-mem/.test(readBack.text), readBack.text.slice(-100));
+  ok('关系边不进大纲', !T.outlineText().includes('相关记忆'));
+  state.tools.get('memory_delete').execute({ name: 'rel-new' });
+  ok('删掉一条后边一并清掉', !T.relatedOf('pl-mem.md').map((r) => r.file).includes('rel-new.md'));
+
+  // 冷热分层：窗口够长时，读到的条目保留完整关键词，没被读到的削短（名字仍在大纲里）。
+  for (let i = 0; i < 60; i += 1) userTurn();
+  read.execute({ file: 'pl-mem' });
+  userTurn();
+  read.execute({ file: 'pl-mem' });
+  const text = T.outlineText();
+  const seg = (name) => text.split(' · ').find((s) => s.startsWith(`${name}=`)) || '';
+  const kwLen = (name) => Array.from(seg(name).slice(name.length + 1)).length;
+  ok('热条目（读到过的）保留长关键词', kwLen('pl-mem') > T.OUTLINE_COLD_KW_MAX, `${kwLen('pl-mem')} 字 / ${seg('pl-mem')}`);
+  ok('冷条目被削短', kwLen('huashu-motion-install') < kwLen('pl-mem') && kwLen('huashu-motion-install') <= T.OUTLINE_COLD_KW_MAX + 8, `${kwLen('huashu-motion-install')} 字 / ${seg('huashu-motion-install')}`);
+  ok('削短后名字还在大纲里', seg('huashu-motion-install').startsWith('huashu-motion-install='));
+  ok('削短的条目以省略号结尾（在关键词边界剪）', /…$/.test(seg('huashu-motion-install')), seg('huashu-motion-install'));
+}
+
 if (process.env.DUMP_PROMPTS) {
   const inv = await call(state, '/dsh-memory/prompts');
   const lines = [
@@ -1320,7 +1356,15 @@ if (process.env.DUMP_PROMPTS) {
     '## 每次请求都发的部分',
     '',
   ];
-  const always = ['系统提示词·大纲抬头', '系统提示词·大纲分组', '工具·memory_read', '工具·memory_write', '工具·memory_update', '工具·memory_delete'];
+  const always = [
+    '系统提示词·大纲抬头',
+    '系统提示词·大纲分组',
+    '工具·memory_read',
+    '工具·memory_source',
+    '工具·memory_write',
+    '工具·memory_update',
+    '工具·memory_delete',
+  ];
   const once = inv.body.items.filter((it) => always.includes(it.id));
   lines.push(`这 ${once.length} 段合计 **${once.reduce((n, it) => n + it.chars, 0)}** 字。`, '');
   for (const it of inv.body.items) {

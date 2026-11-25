@@ -2047,6 +2047,17 @@ window.__ModuleLoader__.load({
                   )
                 : null,
               h(RecallMeter, { rate: entry.recallRate, windowTurns: data && data.windowTurns }),
+              // 关系边数：只有真读到某条时才会被用到，所以这里只给数字，不加任何正文。
+              entry.links
+                ? h(
+                    'span',
+                    {
+                      title: '跟另外几条记忆有双向关系边（memory_read 读完会顺带列出来）；数量=邻居数',
+                      style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)', opacity: 0.85 },
+                    },
+                    `关联 ${entry.links}`,
+                  )
+                : null,
               entry.pendingDelete
                 ? h(
                     'span',

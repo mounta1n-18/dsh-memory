@@ -26,6 +26,8 @@ const OUTLINE_KW_MAX = 42; // 大纲里单条记忆关键词的展示上限；�
 const RECALL = path.join(TIDY, 'recall.json'); // 回忆流水：{turn, file, ts}
 const CALLS = path.join(TIDY, 'calls.json'); // 记忆调用流水：{ts, sessionId, turn, op, target, keywords, chars}
 const CALL_KEEP = 400; // 调用流水最多留这么多条
+const LINKS = path.join(TIDY, 'links.json'); // 记忆之间的关系边：{ "a.md": { "b.md": { w, ts, why } } }
+const LINK_LIMIT = 4; // 读一条记忆时最多顺带提示几条相关记忆
 const TURNS = path.join(TIDY, 'turns.json'); // 全局用户轮计数 {count}
 const WINDOW_TURNS = 100; // 回忆率的统计窗口 = 最近 100 个用户轮
 const COMPRESS_EVERY = 100; // 每 100 轮触发一次压缩判定
@@ -323,19 +325,10 @@ function recallOverview() {
  * 每轮最多一次，且该轮已经读过教训就不再打扰。
  */
 const REMIND_TOOLS = new Set(['write', 'edit', 'pwsh', 'computer_use', 'memory_delete', 'memory_update']);
-/**
- * 破坏性命令的硬闸门（2026-11-15 用户要「最好是硬限制」）：
- * 命中这些命令、而这一轮又没读过任何教训时，直接拒绝一次——先读教训再重试。
- * 只拦「删/覆盖/杀进程/改注册表」这类不可逆动作，日常命令不受影响。
- */
-const DANGER_CMD =
-  /\b(Remove-Item|rmdir|rd\s+\/s|del\s+\/[fsq]|rm\s+-[a-z]*r|git\s+(reset\s+--hard|clean\s+-[a-z]*f)|Stop-Process|taskkill|Format-Volume|Clear-Disk|reg\s+delete|Unregister-ScheduledTask|Remove-ItemProperty)\b/i;
 
 // 拦截话术集中在这里：既给 pre-execute 用，也给 /dsh-memory/prompts 抄录，改一处就够。
 const MEMORY_DIR_DENY_TEXT = '记忆正文要用 memory_read 工具读：先在大纲里挑名称或关键词，再调用它，不要直接翻仓库文件。';
 const MEMORY_DIR_GREP_DENY_TEXT = '不要搜索记忆仓库目录；改用 memory_read，按大纲里的名称或关键词取正文。';
-const DANGER_REASON_TEXT =
-  '这条命令是破坏性的，先看一眼教训再跑——这一轮你还没读任何【教训】：{hooks}。\n用 memory_read 读完相关的那条（可一次传多条），再原样重试这条命令。';
 
 function lessonEntries() {
   try {
@@ -468,6 +461,88 @@ function readThisTurn(files) {
     if (ev && ev.turn === turn && want.has(String(ev.file))) hit.add(String(ev.file));
   }
   return hit;
+}
+
+/**
+ * 记忆之间的关系边（2026-11-25：补上「结构化知识库」这一层）。
+ *
+ * 以前回忆只能靠大纲里的关键词做字面匹配，条目之间彼此孤立——这是召回率上不去的结构性原因。
+ * 现在写新记忆时，dup_check 里点名的相近条目会被记成一条双向边（权重累加），
+ * memory_read 读完一条就顺带提示它的邻居，于是「按图索骥」这条路才通。
+ * 边只是路由，不是内容：不进大纲、不进提示词，只有真的读到某条时才露出来。
+ */
+function readLinks() {
+  const raw = readJson(LINKS, {});
+  return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+}
+
+function stemOf(file) {
+  return String(file || '')
+    .trim()
+    .replace(/\.md$/i, '');
+}
+
+function fileOfStem(stem) {
+  const text = stemOf(stem);
+  return text ? `${text}.md` : '';
+}
+
+/** 记一条双向边；同一条边被反复认出来时权重累加（越常被联想到，排序越靠前）。 */
+function addLink(from, to, why = '') {
+  // 键统一用不带 .md 的名称：索引、大纲、memory_read 里的叫法都是这个名字。
+  const a = stemOf(from);
+  const b = stemOf(to);
+  if (!a || !b || a === b) return;
+  try {
+    const map = readLinks();
+    const put = (x, y) => {
+      const row = map[x] || {};
+      const cur = row[y] || { w: 0, ts: '' };
+      row[y] = { w: (cur.w || 0) + 1, ts: new Date().toISOString(), why: why || cur.why || '' };
+      map[x] = row;
+    };
+    put(a, b);
+    put(b, a);
+    writeJson(LINKS, map);
+  } catch {
+    /* 边写不进去不影响写入本身 */
+  }
+}
+
+/** 删记忆时把它的边一并清掉，否则会留下指向空文件的路由。 */
+function dropLinks(file) {
+  const key = stemOf(file);
+  try {
+    const map = readLinks();
+    delete map[key];
+    for (const from of Object.keys(map)) delete map[from][key];
+    writeJson(LINKS, map);
+  } catch {
+    /* 同上 */
+  }
+}
+
+/** 一条记忆的邻居：按权重降序，只留还存在且启用的条目。 */
+function relatedOf(file, limit = LINK_LIMIT) {
+  try {
+    const row = readLinks()[stemOf(file)] || {};
+    const byFile = new Map(readEntries().map((e) => [stemOf(e.file), e]));
+    return Object.entries(row)
+      .sort((x, y) => (y[1]?.w || 0) - (x[1]?.w || 0))
+      .map(([f, v]) => ({ file: fileOfStem(f), entry: byFile.get(f), w: v?.w || 0 }))
+      .filter((it) => it.entry && it.entry.enabled)
+      .slice(0, limit);
+  } catch {
+    return [];
+  }
+}
+
+/** memory_read 的尾巴：邻条目名 + 去前缀的关键词，够用来判断要不要顺手读。 */
+function relatedNote(file) {
+  const rel = relatedOf(file);
+  if (!rel.length) return '';
+  const parts = rel.map((r) => `${stemOf(r.file)}（${String(r.entry.keywords || '').replace(/^[^/]+\//, '')}）`);
+  return `\n\n相关记忆：${parts.join(' · ')}——需要就 memory_read（可一条命令多传几个）`;
 }
 
 /**
@@ -1092,6 +1167,7 @@ function deleteMemory(file) {
   const ghost = !fs.existsSync(target);
   const indexText = fs.readFileSync(path.join(MEM, 'MEMORY.md'), 'utf8');
   if (!ghost) fs.unlinkSync(target);
+  dropLinks(file);
   try {
     removeIndexRow(file);
   } catch (err) {
@@ -1368,7 +1444,6 @@ function promptInventory() {
   ];
   for (const it of REGISTERED_PROMPTS) items.push({ id: it.id, where: it.where, text: it.text });
   items.push({ id: '工具·动手前提醒', where: '每轮第一次写/改/跑命令时追加', text: lessonReminder() });
-  items.push({ id: '拦截·破坏性命令', where: 'pwsh 命中危险命令且本轮还没读教训时', text: DANGER_REASON_TEXT });
   items.push({ id: '拦截·翻记忆目录', where: 'read/grep/glob 指向记忆仓库时', text: MEMORY_DIR_DENY_TEXT });
   items.push({ id: '校验·按需触发', where: '写入/改写被拒时的报错原文', text: validationTexts().join('\n\n') });
   items.push({ id: '/remember·隐藏指令', where: '用户执行 /remember 时追加', text: `${REMEMBER_INSTRUCTION}\n\n---重试时---\n${REMEMBER_RETRY_INSTRUCTION}` });
@@ -2148,6 +2223,14 @@ const OUTLINE_GROUPS = [
   ['未分类', ''],
 ];
 
+/**
+ * 大纲的冷热分层（2026-11-25，照 Anthropic「顶层只留核心、细节下沉」的口径）：
+ * 窗口内被读到过 ≥2 次的条目算热，完整给关键词；其余只给前几段——名字还在，
+ * 想读随时能 memory_read，但不拿一长串冷记忆去挤占每轮的系统提示词。
+ */
+const OUTLINE_HOT_HITS = 2;
+const OUTLINE_COLD_KW_MAX = 16;
+
 function outlineText(entries = readEntries()) {
   const live = entries.filter((e) => e.enabled && e.keywords);
   if (!live.length) return '';
@@ -2155,6 +2238,11 @@ function outlineText(entries = readEntries()) {
     const head = String(kw).split('/')[0].trim();
     return CATEGORIES.includes(head) ? head : '未分类';
   };
+  const hits = recallRates();
+  // 观察窗口不足 20 轮时不做冷热区分：新装或刚清理时没有统计，全削短既没依据也会伤召回。
+  const windowSize = Math.min(WINDOW_TURNS, turnCount);
+  const coldStart = windowSize < 20;
+  const isHot = (e) => coldStart || e.protected || (hits.get(e.file) || 0) >= OUTLINE_HOT_HITS;
   const lines = [
     '记忆索引（名称=关键词）。关键词是钩子，写的是「什么场景下必须点开这条」。读正文用 memory_read，可一次传多个（file:"a、b"）。',
     '动手改 / 删 / 装 / 跑命令之前，先扫【教训】；提到旧事或接手旧任务，扫对应分组；拿不准就查——查错一次调用，漏查要返工。',
@@ -2169,7 +2257,13 @@ function outlineText(entries = readEntries()) {
         const head = raw.split('/')[0].trim();
         const body = CATEGORIES.includes(head) ? raw.replace(/^[^/]+\//, '') : raw;
         // 组名已经写明了分类，关键词里省掉前缀；裁剪预算按「去前缀后的可用长度」算。
-        const budget = Math.max(12, OUTLINE_KW_MAX - (CATEGORIES.includes(head) ? head.length + 1 : 0));
+        // 冷条只留前几段：名字仍在大纲里，用到时再读正文。
+        // 但至少放得下第一段——宁可多几个字，也不把「huashu-motion-install」切成半截。
+        const prefix = CATEGORIES.includes(head) ? head.length + 1 : 0;
+        const firstLen = Array.from(body.split('/')[0] || '').length;
+        const budget = isHot(e)
+          ? Math.max(10, OUTLINE_KW_MAX - prefix)
+          : Math.max(10, Math.min(OUTLINE_KW_MAX - prefix, Math.max(OUTLINE_COLD_KW_MAX - prefix, firstLen)));
         return `${e.file.replace(/\.md$/, '')}=${clipKeywords(body, budget)}`;
       });
     if (rows.length) lines.push(`【${cat}】${rows.join(' · ')}`);
@@ -2233,9 +2327,11 @@ function snapshot() {
     minHits: pruneMinHits(entries.length, tier),
     tier,
   };
+  const linkMap = readLinks();
   for (const e of entries) {
     const hits = rates.get(e.file);
     e.recallRate = windowSize ? hits || 0 : null;
+    e.links = Object.keys(linkMap[stemOf(e.file)] || {}).length;
     const reviewedAge = daysSince(e.reviewed);
     // 待删除 = 窗口内回忆次数低于当前门槛 + 复核日超过当前淘汰窗口；锁定的、停用的不参与。
     e.pendingDelete = Boolean(
@@ -2481,7 +2577,7 @@ export function apply(ctx) {
             const chunks = picked.map((entry) => {
               const name = entry.file.replace(/\.md$/i, '');
               recordRecall(entry.file); // 回忆率就靠这一行统计，读完才记
-              return `【记忆：${name}】\n\n${readMemoryBody(entry.file)}`;
+              return `【记忆：${name}】\n\n${readMemoryBody(entry.file)}${relatedNote(entry.file)}`;
             });
             const tail = missing.length ? `\n\n（没找到：${missing.join('、')}）` : '';
             return { text: chunks.join('\n\n———\n\n') + tail };
@@ -2619,6 +2715,10 @@ export function apply(ctx) {
               }
               throw new Error(`索引写入失败，已撤回文件：${err.message}`);
             }
+            // 查重结论里点到名的相近条目，记成关系边：以后读到任一条都能顺线索找到另一条。
+            if (dupe.named.length && /相似|相关|并入|相同/.test(dupe.line)) {
+              for (const other of dupe.named) addLink(file, other, dupe.line);
+            }
             return {
               text:
                 `已记下：${file}\n关键词：${keywords}${lengthNote(file, body)}` +
@@ -2733,6 +2833,7 @@ export function apply(ctx) {
             const ghost = !fs.existsSync(target);
             const indexText = fs.readFileSync(path.join(MEM, 'MEMORY.md'), 'utf8');
             if (!ghost) fs.unlinkSync(target);
+            dropLinks(file);
             try {
               removeIndexRow(file);
             } catch (err) {
@@ -2765,13 +2866,8 @@ export function apply(ctx) {
         if ((exec.name === 'grep' || exec.name === 'glob') && (kind === 'root' || kind === 'body')) {
           return { kind: 'deny', reason: MEMORY_DIR_GREP_DENY_TEXT };
         }
-        // 破坏性命令：这一轮还没读教训就拦一次，先读再重试（硬限制，不只靠提醒）。
-        if (exec.name === 'pwsh' && DANGER_CMD.test(String(args.command || '')) && !lessonReadThisTurn()) {
-          const line = lessonHooksLine();
-          if (line) {
-            return { kind: 'deny', reason: DANGER_REASON_TEXT.replace('{hooks}', line) };
-          }
-        }
+        // 破坏性命令不再硬拦（2026-11-25 用户要求关掉）：只保留 post-execute 的动手前提醒，
+        // 判断权交回模型——硬拦会误伤日常命令，也会把「该不该读」变成机械反应。
         // 删除前留一份正文与元数据：删完文件就没了，详情里要显示真正被删掉的内容。
         if (exec.name === 'memory_delete' && exec.callId) {
           const name = String(args.name || '').trim().replace(/\.md$/i, '');
@@ -3147,4 +3243,12 @@ export const __test = {
   sourceLine,
   sourceSessionOf,
   SOURCES,
+  addLink,
+  dropLinks,
+  relatedOf,
+  readLinks,
+  LINKS,
+  outlineText,
+  OUTLINE_HOT_HITS,
+  OUTLINE_COLD_KW_MAX,
 };
