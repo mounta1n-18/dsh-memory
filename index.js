@@ -8,6 +8,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { spawn } from 'node:child_process';
 
 export const name = 'dsh-memory';
@@ -33,6 +34,9 @@ const HIGH_FREQ = 11; // 窗口内 >=11 次 = 高频，不送压缩
 const PRUNE_DAYS_MAX = 45; // 条目很少时给足观察期
 const PRUNE_DAYS_MIN = 10; // 条目很多时收紧到 10 天
 const PRUNE_BASE = 8; // 8 条以内：被读过 1 次就算活
+// 项目记忆的来源会话：头部只记 session 号，整场对话另存到 .sources（不进索引、不进大纲、默认不进上下文）。
+const SOURCES = path.join(MEM, '.sources');
+const SESSIONS_ROOT = path.join(HOME, 'sessions');
 
 /**
  * 记忆总量管控（2026-11-18 用户口径）：被控量 = 记忆条目总数，目标 50 条。
@@ -832,6 +836,200 @@ function rejectFile(file) {
   return file;
 }
 
+/* ───────────────────────── 项目记忆的来源会话 ─────────────────────────
+ * 用户 2026-11-25 口径：项目记忆头部自动注明来源 session 号；那场会话的全部原始
+ * 上下文另存一份备份；除非模型主动来查，否则一个字都不进上下文。
+ * 备份落在 ~/.dsh/memory/.sources/：不是 .md 记忆、不进 MEMORY.md、不进大纲，
+ * 所以既不会被当成一条记忆，也不会被别的流程顺走。
+ */
+
+const SOURCE_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
+
+/**
+ * 会话日志是多帧 zstd（一次 append 一帧），`zstdDecompressSync(整文件)` 只出第一帧，
+ * 流式解码到帧尾报 Unknown frame descriptor——所以按 magic 切帧逐段解。
+ * magic 落在压缩体内部时把边界往后延一格重试。
+ */
+function decodeSessionLog(file) {
+  const buf = fs.readFileSync(file);
+  const offsets = [];
+  for (let i = 0; i <= buf.length - SOURCE_MAGIC.length; i += 1) {
+    if (buf.compare(SOURCE_MAGIC, 0, SOURCE_MAGIC.length, i, i + SOURCE_MAGIC.length) === 0) offsets.push(i);
+  }
+  const parts = [];
+  let index = 0;
+  while (index < offsets.length) {
+    let end = index + 1 < offsets.length ? offsets[index + 1] : buf.length;
+    let decoded;
+    let cursor = index;
+    for (;;) {
+      try {
+        decoded = zlib.zstdDecompressSync(buf.subarray(offsets[cursor], end));
+        break;
+      } catch (err) {
+        cursor += 1;
+        if (cursor >= offsets.length) throw err;
+        end = cursor + 1 < offsets.length ? offsets[cursor + 1] : buf.length;
+      }
+    }
+    parts.push(decoded);
+    index = cursor + 1;
+  }
+  return Buffer.concat(parts).toString('utf8');
+}
+
+/** 在 ~/.dsh/sessions/<工程目录>/<会话>/session.v4.jsonl.zstd 里找这场会话的日志。 */
+function sessionLogPath(sessionId) {
+  const raw = String(sessionId || '').trim();
+  if (!/^(session-)?[0-9a-f][0-9a-f-]{7,}$/i.test(raw)) return '';
+  const names = raw.startsWith('session-') ? [raw] : [raw, `session-${raw}`];
+  let dirs = [];
+  try {
+    dirs = fs.readdirSync(SESSIONS_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory());
+  } catch {
+    return '';
+  }
+  for (const dir of dirs) {
+    for (const name of names) {
+      const file = path.join(SESSIONS_ROOT, dir.name, name, 'session.v4.jsonl.zstd');
+      if (fs.existsSync(file)) return file;
+    }
+  }
+  return '';
+}
+
+function clipText(text, max) {
+  const s = String(text || '');
+  return s.length <= max ? s : `${s.slice(0, max)}…[截断 ${s.length - max} 字]`;
+}
+
+/**
+ * 把会话事件渲染成能读的「原始上下文」：用户原话、助手正文、工具调用与结果。
+ * 推理块（reasoning）是过程噪音，丢掉；工具结果单条截到 800 字，原始日志另存一份兜底。
+ */
+function renderSessionTranscript(text) {
+  const out = [];
+  const stats = { turns: 0, user: 0, assistant: 0, tool: 0 };
+  let turn = 0;
+  for (const line of String(text || '').split('\n')) {
+    if (!line) continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const ev = row?.event ?? row;
+    if (!ev || typeof ev.type !== 'string') continue;
+    const data = ev.data || {};
+    if (ev.type === 'turn/start') {
+      stats.turns += 1;
+      turn = Number(data.turn) || stats.turns;
+      continue;
+    }
+    if (ev.type === 'user/message') {
+      if (data?.source?.kind !== 'user') continue;
+      const said = (data.content || [])
+        .filter((b) => b?.type === 'text')
+        .map((b) => String(b.text || ''))
+        .join('\n')
+        .trim();
+      if (!said) continue;
+      stats.user += 1;
+      out.push(`\n## 用户${turn ? `（第 ${turn} 轮）` : ''}\n\n${said}`);
+      continue;
+    }
+    if (ev.type === 'assistant/message') {
+      const blocks = data?.message?.content || [];
+      const texts = blocks
+        .filter((b) => b?.type === 'text')
+        .map((b) => String(b.text || '').trim())
+        .filter(Boolean);
+      if (texts.length) {
+        stats.assistant += 1;
+        out.push(`\n## 助手\n\n${texts.join('\n\n')}`);
+      }
+      for (const call of blocks.filter((b) => b?.type === 'tool-call')) {
+        stats.tool += 1;
+        out.push(`\n► ${call.name || '?'} ${clipText(call.arguments || '', 400)}`);
+      }
+      continue;
+    }
+    if (ev.type === 'tool/result') {
+      const got = (data?.message?.content || [])
+        .filter((b) => b?.type === 'text')
+        .map((b) => String(b.text || ''))
+        .join('\n')
+        .trim();
+      if (got) out.push(`◄ ${clipText(got, 800)}`);
+    }
+  }
+  return { md: out.join('\n').trim(), stats };
+}
+
+/**
+ * 备份一条会话的原始上下文（幂等：日志大小没变、备份还在，就直接复用）。
+ * 产出三个文件：<id>.md（可读转录）、<id>.jsonl.zst（原始日志副本）、<id>.json（元信息）。
+ */
+function ensureSessionSource(sessionId) {
+  const id = String(sessionId || '').trim();
+  if (!id) throw new Error('缺少会话号');
+  const log = sessionLogPath(id);
+  if (!log) throw new Error(`找不到会话 ${id} 的日志（可能已被清理）`);
+  fs.mkdirSync(SOURCES, { recursive: true });
+  const base = path.join(SOURCES, id);
+  const mdFile = `${base}.md`;
+  const zstFile = `${base}.jsonl.zst`;
+  const metaFile = `${base}.json`;
+  const logSize = fs.statSync(log).size;
+  let meta = null;
+  try {
+    meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+  } catch {
+    meta = null;
+  }
+  if (meta && meta.logSize === logSize && fs.existsSync(mdFile) && fs.existsSync(zstFile)) {
+    return { ...meta, file: mdFile, cached: true };
+  }
+  const { md, stats } = renderSessionTranscript(decodeSessionLog(log));
+  const head = [
+    `# ${id} 原始上下文`,
+    '',
+    `- 会话日志：${log}`,
+    `- 轮次 ${stats.turns} · 用户 ${stats.user} · 助手 ${stats.assistant} · 工具调用 ${stats.tool}`,
+    `- 生成时间：${new Date().toISOString()}`,
+    '',
+  ].join('\n');
+  const full = `${head.trimEnd()}\n${md}\n`;
+  fs.writeFileSync(mdFile, full, 'utf8');
+  fs.writeFileSync(zstFile, fs.readFileSync(log));
+  meta = {
+    session: id,
+    log,
+    file: mdFile,
+    zst: zstFile,
+    chars: Array.from(full).length,
+    logSize,
+    stats,
+    builtAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(metaFile, JSON.stringify(meta, null, 2), 'utf8');
+  return { ...meta, cached: false };
+}
+
+/** 记忆正文头部的来源行；没有会话号就不写。 */
+function sourceLine(sessionId) {
+  const id = String(sessionId || '').trim();
+  if (!id) return '';
+  return `> 来源会话：${id}（原始上下文已另存本机；要看原文用 memory_source，默认不载入）`;
+}
+
+/** 从正文头部的来源行里取回会话号。 */
+function sourceSessionOf(body) {
+  const hit = String(body || '').match(/来源会话[：:]\s*(session-[0-9a-f-]{8,})/i);
+  return hit ? hit[1] : '';
+}
+
 /**
  * 设置页新建一条记忆：文件和索引行一起写。
  * 先写文件再补索引；索引补不上就把文件撤回，不留孤儿（旧版 memory_write 就栽在这）。
@@ -851,10 +1049,22 @@ function createMemory(input) {
   assertCategory(keywords, { allowManual: true });
   if (!description) throw new Error('描述不能为空，一句话说清什么时候读');
   if (!body) throw new Error('正文不能为空');
+  // 项目记忆（人工通道）在正文最前面记来源会话，并把那场会话的原始上下文备份到 .sources。
+  const session = oneLine(input?.session, 80);
+  const head = sourceLine(session);
+  const fullBody = head ? `${head}\n\n${body}` : body;
+  if (session) {
+    try {
+      ensureSessionSource(session);
+    } catch (err) {
+      // 备份失败不该挡住记忆本身：头部照样记下会话号，回头还能重试。
+      logPluginError('/memory source backup', err);
+    }
+  }
   const target = path.join(MEM, file);
   fs.writeFileSync(
     target,
-    joinDoc([`name: ${name}`, `description: ${description}`, `type: ${type}`, `reviewed: ${today()}`], body),
+    joinDoc([`name: ${name}`, `description: ${description}`, `type: ${type}`, `reviewed: ${today()}`], fullBody),
     'utf8',
   );
   try {
@@ -1046,6 +1256,7 @@ const READ_TOOL_DESCRIPTION = [
   '读取记忆正文。上下文里有一行「记忆 ▸ 名称=关键词」，先按关键词挑出和当前任务对得上的，再用本工具取原文。',
   '可以一次读多条：file 用「、」或逗号分隔（如 "noahs-ark、审计日志"），比一条条读省调用、也更适合「动手前先把相关教训都扫一遍」。',
   '「教训/」开头的条目是**动手前**必查的：只要它的动作场景落进你这次要做的事，先读它、再动手；不要等报了错才回来找。',
+  '项目记忆正文头部有「> 来源会话：session-…」：正文不够用时用 memory_source 去查那场会话的原始上下文。',
   '不要用 read / grep / glob / 命令行去翻记忆仓库：插件会拒绝，而且那样更慢。',
   'file 传大纲里的名称（如 user-profile），也可以传一个关键词（如 身份）。',
 ].join(' ');
@@ -1062,6 +1273,13 @@ const DELETE_TOOL_DESCRIPTION = [
   '删除一条确实没用了的记忆，同时删掉索引行。删除前确认没有别的记忆在引用它。',
   '这是不可回滚的删除：正文文件直接删掉，只在记忆调用流水里留一份留底。',
   '锁定的记忆会被拒绝，需要用户先在设置页解锁。',
+].join(' ');
+
+const SOURCE_TOOL_DESCRIPTION = [
+  '查一条「项目记忆」的原始上下文：它头部写着来源会话，那场会话的完整对话备份在本机，平时一个字都不进上下文。',
+  'mode=meta（默认）只回元信息（会话号、备份文件、字数、统计），先看这个再决定要不要真读。',
+  'mode=read 按字符区间读：offset/limit（默认 0/4000）；mode=find 用 pattern 找片段，回最多 8 处并带字符偏移，便于接着 read。',
+  '只有当项目记忆正文不够用、必须回看当时原话与命令时才调它——读进来就是真金白银的 token。',
 ].join(' ');
 
 const REMEMBER_TOOL = {
@@ -1834,7 +2052,7 @@ async function rememberConversation(agent, hostCtx) {
   if (parts.length < 2) parts.push(name);
   const keywords = parts.slice(0, 6).join('/');
   const description = oneLine(args?.description) || `${name} 的项目记忆`;
-  const file = createMemory({ name, keywords, description, body, type: 'reference' });
+  const file = createMemory({ name, keywords, description, body, type: 'reference', session: agent?.session?.id || '' });
   // 「对话归纳」也进流水：它没有工具调用，所以没有 callId（详情里不提供轨迹定位）。
   appendCall({
     sessionId: agent?.session?.id || '',
@@ -2270,6 +2488,85 @@ export function apply(ctx) {
           },
         }),
       'memory read tool',
+    );
+
+    // 查项目记忆的原始上下文：默认只回元信息，读正文要显式 offset/limit。
+    toolCtx.effect(
+      () =>
+        toolSink.register({
+          name: 'memory_source',
+          description: SOURCE_TOOL_DESCRIPTION,
+          parameters: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: '项目记忆的名称（大纲里的 name，可带或不带 .md）。' },
+              mode: { type: 'string', enum: ['meta', 'read', 'find'], description: 'meta=元信息（默认）；read=按字符区间读；find=按 pattern 找片段。' },
+              offset: { type: 'number', description: 'mode=read 时的起始字符，默认 0。' },
+              limit: { type: 'number', description: 'mode=read 时读多少字符，默认 4000（上限 20000）。' },
+              pattern: { type: 'string', description: 'mode=find 时的匹配串（按正则用，不合法就当纯文本）。' },
+            },
+            required: ['name'],
+            additionalProperties: false,
+          },
+          output: {
+            schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'], additionalProperties: false },
+            render(_args, value) {
+              return [{ type: 'text', text: String(value?.text ?? '') }];
+            },
+          },
+          execute(args) {
+            const name = String(args?.name || '').trim();
+            if (!name) throw new Error('需要 name：一条项目记忆的名称');
+            const entry = resolveEntry(name);
+            if (!entry) throw new Error(`没有找到记忆「${name}」`);
+            const session = sourceSessionOf(readMemoryBody(entry.file));
+            if (!session) {
+              throw new Error(`记忆 ${entry.file} 没有来源会话（只有 /remember 生成或带 session 新建的项目记忆才有原始上下文）`);
+            }
+            const meta = ensureSessionSource(session);
+            const text = fs.readFileSync(meta.file, 'utf8');
+            const chars = Array.from(text);
+            const mode = String(args?.mode || 'meta').toLowerCase();
+            if (mode === 'read') {
+              const offset = clampNum(args?.offset ?? 0, 0, chars.length);
+              const limit = clampNum(args?.limit ?? 4000, 200, 20000);
+              const end = Math.min(chars.length, offset + limit);
+              return {
+                text: `【原文 ${session}】字符 ${offset}..${end} / 共 ${chars.length}${end < chars.length ? `（还有 ${chars.length - end} 字，接着用 offset=${end}）` : ''}\n\n${chars.slice(offset, end).join('')}`,
+              };
+            }
+            if (mode === 'find') {
+              const pattern = String(args?.pattern || '').trim();
+              if (!pattern) throw new Error('mode=find 需要 pattern');
+              let re;
+              try {
+                re = new RegExp(pattern, 'gi');
+              } catch {
+                re = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+              }
+              const hits = [];
+              let hit;
+              while ((hit = re.exec(text)) && hits.length < 8) {
+                const at = hit.index;
+                hits.push(`（字符 ${at}）…${text.slice(Math.max(0, at - 160), at + 240).replace(/\s+/g, ' ')}…`);
+                if (re.lastIndex === hit.index) re.lastIndex += 1;
+              }
+              return { text: hits.length ? `【原文 ${session}】命中 ${hits.length} 处：\n\n${hits.join('\n\n')}` : `【原文 ${session}】没找到「${pattern}」` };
+            }
+            const st = meta.stats || {};
+            return {
+              text: [
+                `【原文备份】${session}`,
+                `可读转录：${meta.file}（${meta.chars} 字）`,
+                `原始日志副本：${meta.zst}`,
+                `统计：轮次 ${st.turns ?? '?'} · 用户 ${st.user ?? '?'} · 助手 ${st.assistant ?? '?'} · 工具调用 ${st.tool ?? '?'}`,
+                `备份时间：${meta.builtAt}${meta.cached ? '（复用已有备份）' : ''}`,
+                '要看内容：mode=read（offset/limit）或 mode=find（pattern）。',
+              ].join('\n'),
+            };
+          },
+        }),
+      'memory source tool',
     );
 
     // 一次调用写一条记忆：插件负责建文件、补索引、查重、报字数。
@@ -2836,4 +3133,18 @@ export function apply(ctx) {
 }
 
 /** 给 tools/selfcheck.mjs 用的纯函数出口：压缩预算、工具声明、回包解析。 */
-export const __test = { compressMaxTokens, compressToolSpec, toolCallItems, parseCompressItems, COMPRESS_MAX_TOKENS, COMPRESS_MAX_TOKENS_CAP };
+export const __test = {
+  compressMaxTokens,
+  compressToolSpec,
+  toolCallItems,
+  parseCompressItems,
+  COMPRESS_MAX_TOKENS,
+  COMPRESS_MAX_TOKENS_CAP,
+  decodeSessionLog,
+  sessionLogPath,
+  renderSessionTranscript,
+  ensureSessionSource,
+  sourceLine,
+  sourceSessionOf,
+  SOURCES,
+};

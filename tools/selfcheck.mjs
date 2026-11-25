@@ -15,6 +15,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // 路径里可能有空格（如 `C:\DSH Plugin\...`）：必须走 fileURLToPath，
@@ -269,7 +270,7 @@ apply(ctx);
 console.log(`\n[1] 装载面  DSH_HOME=${HOME}`);
 eq('两段系统提示注入', state.sections.length, 2);
 ok('注入顺序 outline < tidy-status', state.sections[0].name === 'memory:outline' && state.sections[1].name === 'memory:tidy-status');
-eq('四个模型工具', [...state.tools.keys()].sort().join(','), 'memory_delete,memory_read,memory_update,memory_write');
+eq('五个模型工具', [...state.tools.keys()].sort().join(','), 'memory_delete,memory_read,memory_source,memory_update,memory_write');
 eq('十七条路由（含 /remember、保留、提示词检视、调用流水/详情与探针）', state.routes.size, 17);
 
 console.log('\n[2] 大纲不丢条目');
@@ -1232,6 +1233,77 @@ console.log('\n[18] 客户端配色跟着主题走（深色模式不回潮）');
   ok('环轨取主题变量', cli.includes('var(--dsw-alias-border-l2)'));
   ok('环的两段取品牌色', cli.includes("stroke: 'var(--dsw-alias-brand-primary)'"));
   ok('差异行改成叠色（深浅主题都读得清）', cli.includes('rgba(226, 87, 76, 0.28)') && cli.includes('rgba(47, 163, 107, 0.28)'));
+}
+
+console.log('\n[19] 项目记忆的来源会话与原始上下文备份');
+{
+  const SID = 'session-11112222-3333-4444-5555-666677778888';
+  const sessDir = path.join(HOME, 'sessions', '--selfcheck--', SID);
+  fs.mkdirSync(sessDir, { recursive: true });
+  const logFile = path.join(sessDir, 'session.v4.jsonl.zstd');
+  // 多帧拼接是真实形态：一次 append 一帧，整文件一口气解不开。
+  const frame = (rows) => zlib.zstdCompressSync(Buffer.from(rows.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8'));
+  fs.writeFileSync(
+    logFile,
+    Buffer.concat([
+      frame([{ type: 'turn/start', data: { turn: 1 } }, { type: 'user/message', data: { content: [{ type: 'text', text: '第一句用户原话' }], source: { kind: 'user' } } }]),
+      frame([
+        { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '助手回答' }, { type: 'tool-call', name: 'memory_read', arguments: '{"file":"pl-mem"}' }] } } },
+        { type: 'tool/result', data: { message: { content: [{ type: 'text', text: '记忆正文片段' }] } } },
+        { type: 'system/message', data: { content: [{ type: 'text', text: '系统提示不该进转录' }] } },
+      ]),
+    ]),
+  );
+  eq('多帧会话日志能找到', T.sessionLogPath(SID), logFile);
+  const decoded = T.decodeSessionLog(logFile);
+  ok('两帧都解出来了', decoded.includes('第一句用户原话') && decoded.includes('助手回答'));
+  const rendered = T.renderSessionTranscript(decoded);
+  ok('转录保留用户与助手', rendered.md.includes('## 用户（第 1 轮）') && rendered.md.includes('## 助手'));
+  ok('工具调用与结果都在', rendered.md.includes('► memory_read') && rendered.md.includes('◄ 记忆正文片段'));
+  ok('系统消息不进转录', !rendered.md.includes('系统提示不该进转录'));
+  eq('统计对得上', JSON.stringify(rendered.stats), JSON.stringify({ turns: 1, user: 1, assistant: 1, tool: 1 }));
+
+  const line = T.sourceLine(SID);
+  ok('来源行带会话号', line.startsWith('> 来源会话：') && line.includes(SID), line);
+  eq('来源行能反解回会话号', T.sourceSessionOf(`> 来源会话：${SID}（原始上下文已另存）`), SID);
+  eq('没有来源行的正文解出空串', T.sourceSessionOf('普通正文'), '');
+
+  const meta = T.ensureSessionSource(SID);
+  ok('备份出可读转录与原始日志副本', fs.existsSync(meta.file) && fs.existsSync(meta.zst), `${meta.chars} 字`);
+  ok('备份幂等（第二次直接复用）', T.ensureSessionSource(SID).cached === true);
+
+  const created = await call(state, '/dsh-memory/create', {
+    name: 'tmp-src',
+    keywords: '项目记忆/自检来源',
+    description: '自检用',
+    body: '项目正文',
+    session: SID,
+  });
+  eq('带 session 新建成功', created.body.created, 'tmp-src.md');
+  const bodyFile = fs.readFileSync(path.join(MEM, 'tmp-src.md'), 'utf8');
+  ok('正文头部自动注明来源会话', bodyFile.includes(`> 来源会话：${SID}`) && bodyFile.indexOf('> 来源会话：') < bodyFile.indexOf('项目正文'));
+
+  const readTool = state.tools.get('memory_read');
+  const readBack = await readTool.execute({ file: 'tmp-src' });
+  ok('memory_read 带上头部来源行', readBack.text.includes(`> 来源会话：${SID}`));
+
+  const src = state.tools.get('memory_source');
+  const m1 = await src.execute({ name: 'tmp-src' });
+  ok('meta 回会话号与统计', m1.text.includes(SID) && /轮次 1/.test(m1.text), m1.text.split('\n')[0]);
+  ok('meta 不吐正文', !m1.text.includes('第一句用户原话'));
+  const m2 = await src.execute({ name: 'tmp-src', mode: 'read', offset: 0, limit: 120 });
+  ok('read 按字符区间回原文', m2.text.includes('字符 0..') && m2.text.includes('原始上下文'), m2.text.split('\n')[0]);
+  const m3 = await src.execute({ name: 'tmp-src', mode: 'find', pattern: '第一句用户原话' });
+  ok('find 命中并带字符偏移', /（字符 \d+）/.test(m3.text) && m3.text.includes('第一句用户原话'));
+  const m4 = await src.execute({ name: 'tmp-src', mode: 'find', pattern: '根本没有这句' });
+  ok('find 没命中如实说', /没找到/.test(m4.text));
+  let noSource = '';
+  try {
+    await src.execute({ name: 'user-profile' });
+  } catch (err) {
+    noSource = err.message;
+  }
+  ok('没有来源会话的记忆被拒', /没有来源会话/.test(noSource), noSource);
 }
 
 // 需要一份「模型能看到的全部提示词」时：DUMP_PROMPTS=<文件.md> node tools/selfcheck.mjs
