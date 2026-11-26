@@ -10,6 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { spawn } from 'node:child_process';
+import { buildIndex, embedTexts, readIndex, resolveEmbedConfig, writeIndex } from './indexer.js';
 
 export const name = 'dsh-memory';
 
@@ -212,6 +213,7 @@ const PROMPTS_ROUTE = '/dsh-memory/prompts'; // 只读：把模型能看到的�
 const CREATE_ROUTE = '/dsh-memory/create';
 const DELETE_ROUTE = '/dsh-memory/delete';
 const SEARCH_ROUTE = '/dsh-memory/search';
+const REINDEX_ROUTE = '/dsh-memory/reindex'; // 2.0：重建章节级向量索引（增量）
 const CALLS_ROUTE = '/dsh-memory/calls';
 const CALL_ROUTE = '/dsh-memory/call';
 const COMPRESS_ROUTE = '/dsh-memory/compress';
@@ -1274,6 +1276,45 @@ function deleteMemory(file) {
  * 设置页搜索：关键词、「何时读」、frontmatter 描述、正文都算命中。
  * 正文命中时给原文附近几行（±2 行，最多 3 处），前端直接展示。
  */
+/**
+ * 2.0 阶段二：重建「章节级」向量索引。
+ * - 正文仍是唯一真源，索引落在 `memory/.index/`，整目录删掉也能重建；
+ * - 增量：段 id 带内容哈希，没变的段直接复用旧向量，不重复花钱；
+ * - names 只表示「这几个文件强制重算」，full 表示「连清单里的模型维度都重来」。
+ */
+async function reindexMemories(opts = {}) {
+  const cfg = resolveEmbedConfig();
+  if (!cfg.apiKey) {
+    throw new Error('还没有配置 embedding 的 Key：设 DSH_MEMORY_EMBED_KEY，或让 ~/.bailian/config.json 里有 api_key');
+  }
+  const files = [];
+  for (const entry of readEntries()) {
+    const body = readMemoryBody(entry.file);
+    if (!body.trim()) continue;
+    const name = entry.file.replace(/\.md$/, '');
+    const head = String(entry.keywords || '').split('/')[0].trim();
+    files.push({
+      name,
+      file: entry.file,
+      body,
+      // 阶段二先沿用关键词当摘要；阶段七换成一句话 summary
+      summary: entry.keywords || '',
+      keywords: entry.keywords || '',
+      category: CATEGORIES.includes(head) ? head : '其它',
+    });
+  }
+  if (!files.length) throw new Error('没有可索引的记忆');
+  const built = await buildIndex(files, readIndex(MEM), {
+    full: Boolean(opts.full),
+    force: Array.isArray(opts.names) ? opts.names : [],
+    model: cfg.model,
+    dim: cfg.dim,
+    embed: (texts) => embedTexts(texts, cfg),
+  });
+  writeIndex(MEM, built);
+  return { ...built.stats, key: cfg.masked, baseUrl: cfg.baseUrl };
+}
+
 function searchMemories(rawQuery) {
   const q = String(rawQuery || '').trim();
   if (!q) return { q, matches: [] };
@@ -3242,6 +3283,20 @@ export function apply(ctx) {
             try {
               const body = JSON.parse(await readBody(req));
               sendJson(res, 200, searchMemories(String(body.q || '')));
+            } catch (err) {
+              sendJson(res, 400, { error: err.message });
+            }
+          },
+        }),
+        webCtx.webServer.register({
+          kind: 'exact',
+          path: REINDEX_ROUTE,
+          handler: async (req, res) => {
+            if (req.method !== 'POST') return sendJson(res, 405, { error: 'method' });
+            try {
+              const body = JSON.parse((await readBody(req)) || '{}');
+              const stats = await reindexMemories({ full: Boolean(body.full), names: body.names });
+              sendJson(res, 200, stats);
             } catch (err) {
               sendJson(res, 400, { error: err.message });
             }

@@ -273,7 +273,7 @@ console.log(`\n[1] 装载面  DSH_HOME=${HOME}`);
 eq('两段系统提示注入', state.sections.length, 2);
 ok('注入顺序 outline < tidy-status', state.sections[0].name === 'memory:outline' && state.sections[1].name === 'memory:tidy-status');
 eq('五个模型工具', [...state.tools.keys()].sort().join(','), 'memory_delete,memory_read,memory_source,memory_update,memory_write');
-eq('十八条路由（含 /remember、保留、口径控制、提示词检视、调用流水/详情与探针）', state.routes.size, 18);
+eq('十九条路由（含 /remember、保留、口径控制、提示词检视、重建索引、调用流水/详情与探针）', state.routes.size, 19);
 
 console.log('\n[2] 大纲不丢条目');
 const outline = state.sections[0].text();
@@ -1451,6 +1451,72 @@ console.log('\n[22] 2.0 仓库骨架与工具契约（阶段一）');
     S.embedText({ name: 'demo', category: '教训', summary: '删家目录前必读', heading: '为什么', text: '正文' }),
     'demo | 教训 | 删家目录前必读 | 为什么\n正文',
   );
+}
+
+console.log('\n[23] 2.0 章节级索引（阶段二）');
+{
+  const IDX = await import(pathToFileURL(path.join(PKG, 'indexer.js')).href);
+  const S = await import(pathToFileURL(path.join(PKG, 'store.js')).href);
+  const sections = IDX.splitSections('前言\n## 为什么\n正文 A\n## 怎么用\n正文 B');
+  eq('按 ## 切小节', sections.map((s) => s.heading).join('|'), '为什么|怎么用');
+  eq('超长小节按空行再切', IDX.splitLong(`${'a'.repeat(300)}\n\n${'b'.repeat(300)}`, 500).length, 2);
+
+  const memDir = path.join(HOME, 'idx-demo');
+  const alpha = {
+    name: 'alpha',
+    file: 'alpha.md',
+    body: `## 一\n${'甲'.repeat(80)}\n## 二\n${'乙'.repeat(80)}`,
+    summary: '资料/甲/乙',
+    keywords: '资料/甲/乙',
+    category: '资料',
+  };
+  const beta = { name: 'beta', file: 'beta.md', body: `## 一\n${'丙'.repeat(80)}`, summary: '教训/丙', keywords: '教训/丙', category: '教训' };
+  const dim = 8;
+  const fakeEmbed = (texts) => texts.map(() => Array.from({ length: dim }, () => 1 / Math.sqrt(dim)));
+
+  const first = await IDX.buildIndex([alpha, beta], null, { dim, model: 'm', embed: fakeEmbed });
+  eq('两条记忆切出 3 段', first.segments.length, 3);
+  eq('首建全部嵌入', first.stats.embedded, 3);
+  eq('向量文件 = 段×维度×4 字节', first.buffer.length, 3 * dim * 4);
+  ok('清单通过校验', S.validateManifest(first.manifest).ok, S.validateManifest(first.manifest).errors.join('; '));
+  ok('段里记了向量偏移', first.segments[1].voff === dim * 4 && first.segments[1].vlen === dim * 4);
+
+  IDX.writeIndex(memDir, first);
+  const prev = IDX.readIndex(memDir);
+  eq('读回 3 段', prev.segments.length, 3);
+  ok('读回 3 条向量且维度对', prev.vectors.length === 3 && prev.vectors[0].length === dim);
+  ok('向量已 L2 归一化', Math.abs(Math.hypot(...prev.vectors[0]) - 1) < 1e-4);
+
+  const again = await IDX.buildIndex([alpha, beta], prev, { dim, model: 'm', embed: fakeEmbed });
+  eq('内容没变就零嵌入', again.stats.embedded, 0);
+  eq('全部复用旧向量', again.stats.reused, 3);
+
+  const beta2 = { ...beta, body: `## 一\n${'丁'.repeat(80)}` };
+  const third = await IDX.buildIndex([alpha, beta2], prev, { dim, model: 'm', embed: fakeEmbed });
+  eq('只改一条就只重算那一条', third.stats.embedded, 1);
+
+  const forced = await IDX.buildIndex([alpha, beta], prev, { dim, model: 'm', embed: fakeEmbed, force: ['alpha'] });
+  eq('names 强制重算指定文件', forced.stats.embedded, 2);
+
+  let bad = '';
+  try {
+    await IDX.buildIndex([alpha], null, { dim, model: 'm', embed: (texts) => texts.map(() => [1, 2]) });
+  } catch (err) {
+    bad = err.message;
+  }
+  ok('向量维度不符会报错', /维度/.test(bad), bad);
+
+  eq('只给域名就补成兼容端点', IDX.embedEndpoint('https://dashscope.aliyuncs.com'), 'https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings');
+  eq(
+    '已是兼容端点就不重复拼',
+    IDX.embedEndpoint('https://dashscope.aliyuncs.com/compatible-mode/v1'),
+    'https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings',
+  );
+
+  const cfg = IDX.resolveEmbedConfig({ USERPROFILE: path.join(HOME, 'nokey'), DSH_MEMORY_EMBED_KEY: '' });
+  eq('没配置时 apiKey 为空', cfg.apiKey, '');
+  eq('默认模型是 text-embedding-v4', cfg.model, 'text-embedding-v4');
+  eq('默认维度 1024', cfg.dim, 1024);
 }
 
 if (process.env.DUMP_PROMPTS) {

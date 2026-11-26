@@ -233,8 +233,33 @@ plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路�
 - `selfcheck.mjs`：mock 一个 cordis ctx 把 `apply()` 整条路径跑起来（临时 `DSH_HOME`，不碰真实记忆库），覆盖装载面、大纲（含冷热分层）、关系边、status、分类约束、回忆统计、新建/删除、搜索、压缩、/remember、调用流水、保留与动手前提醒、查重（模型自己判断）/并条目/空泛词/淘汰线、总量口径、提示词检视、压缩结构化输出、客户端配色不回潮、项目记忆来源会话与原文备份共 314 项。**改完先跑它，再考虑重启**：`node tools/selfcheck.mjs`。
 - `tidy.mjs` + `run.cmd`：旧的「整理」worker，**已不再挂计划任务**（压缩不是定时任务）。保留作手动兜底：`node tools/tidy.mjs [--dry-run|--if-due]`，只写 `proposed/` 与 `status.json`。
 
-## 未完成
+## 2.0 章节级索引（阶段二）
 
+正文仍是唯一真源：索引单独放 `memory/.index/`，整个目录删掉也能重建，MEMORY.md 与正文一个字都不动。
+
+| 文件 | 内容 |
+| --- | --- |
+| `manifest.json` | 模型、维度、归一化方式、每个 `.md` 的内容哈希与段 id 列表 |
+| `segments.jsonl` | 一段一行：`id / name / heading / text / hash / category / voff / vlen` |
+| `vectors.bin` | 定长 Float32 向量流，第 i 段占 `[i*dim*4, (i+1)*dim*4)` |
+
+切段口径（`store.js` 的 `SEGMENT_RULES`）：按 `## ` 切小节，单段 >500 字按空行再切，`overlap=0`，<24 字的碎段丢弃。嵌入文本 = `名称 | 分类 | 摘要 | 小节标题` + 换行 + 正文。
+
+增量靠段 id：`名称#序号@内容哈希前8位`。内容没变的段直接复用旧向量，只有变了的段才重新调接口——实测 41 条记忆 161 段，第二次重建「新嵌入 0 / 复用 161 / 4ms」。
+
+配置：`DSH_MEMORY_EMBED_KEY`，或直接读本机 `~/.bailian/config.json` 的 `api_key`；`DSH_MEMORY_EMBED_MODEL` / `DSH_MEMORY_EMBED_DIM` / `DSH_MEMORY_EMBED_BASE` 可覆盖默认值（`text-embedding-v4` / 1024 维 / 百炼兼容端点，只给域名也行，会自动补 `/compatible-mode/v1`）。
+
+```bash
+node tools/reindex.mjs                        # 全量增量重建
+node tools/reindex.mjs --names a,b            # 只强制重算这两个文件
+node tools/reindex.mjs --out /tmp/x --dry     # 演练：算但不写、写到别处
+```
+
+HTTP：`POST /dsh-memory/reindex`，body 可带 `{"full":true,"names":["a"]}`，回 `{files, segments, embedded, reused, dim, model, ms}`。
+
+成本（2026-11-26 实测）：全库 41 条 / 51,981 字 / 161 段，首次嵌入约 6.7 秒、约 0.02 元；之后重建只花毫秒级。
+
+## 未完成
 - 压缩只按「回忆次数」分档；窗口不足 100 轮（手动点「仿生压缩」提前跑）时用的是次数而不是百分比，语义上等价于按满窗折算。
 - 卡片聚类顺序写死为 `资料 / 教训 / 说明书 / 项目记忆 / 其它 / 未分类`，没有做成可配置。
 

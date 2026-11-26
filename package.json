@@ -24,6 +24,7 @@
     "index.js",
     "client.js",
     "store.js",
+    "indexer.js",
     "cordis.patch.yml",
     "icon.svg",
     "README.md"
