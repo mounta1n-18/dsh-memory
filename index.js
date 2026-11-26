@@ -10,8 +10,9 @@ import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { spawn } from 'node:child_process';
-import { buildIndex, embedTexts, readIndex, resolveEmbedConfig, writeIndex } from './indexer.js';
+import { buildIndex, embedTexts, hashText, readIndex, resolveEmbedConfig, writeIndex } from './indexer.js';
 import { MEMORY_BODY_MAX } from './store.js';
+import { bm25Rank, cosineRank, oneLineSummary, rrfFuse } from './search.js';
 
 export const name = 'dsh-memory';
 
@@ -1329,6 +1330,139 @@ async function reindexMemories(opts = {}) {
   });
   writeIndex(MEM, built);
   return { ...built.stats, key: cfg.masked, baseUrl: cfg.baseUrl };
+}
+
+/**
+ * 2.0 阶段三：先确保索引跟正文一致（按内容哈希判断），再做混合检索。
+ * 索引不存在或内容变了就顺手重建——检索本来就要读正文，多做一步几乎不额外花钱。
+ */
+async function ensureIndex({ force = false } = {}) {
+  const cfg = resolveEmbedConfig();
+  const prev = readIndex(MEM);
+  const files = [];
+  for (const entry of readEntries()) {
+    if (!entry.enabled) continue;
+    const body = readMemoryBody(entry.file);
+    if (!body.trim()) continue;
+    const name = entry.file.replace(/\.md$/, '');
+    const head = String(entry.keywords || '').split('/')[0].trim();
+    files.push({
+      name,
+      file: entry.file,
+      body,
+      summary: entry.keywords || '',
+      keywords: entry.keywords || '',
+      category: CATEGORIES.includes(head) ? head : '其它',
+    });
+  }
+  if (!files.length) return { idx: prev, rebuilt: false, degraded: false, reason: '没有可索引的记忆' };
+
+  const known = prev.manifest?.files || {};
+  const changed = files.filter((f) => known[`${f.name}.md`]?.hash !== hashText(String(f.body || ''))).map((f) => f.name);
+  const sameModel = prev.manifest?.model === cfg.model && prev.manifest?.dim === cfg.dim;
+  const needBuild = force || !prev.manifest || !sameModel || changed.length > 0 || prev.segments.length === 0;
+  if (!needBuild) return { idx: prev, rebuilt: false, degraded: false, stats: null };
+
+  if (!cfg.apiKey) return { idx: prev, rebuilt: false, degraded: true, reason: '没有 embedding Key，只能走字面检索' };
+  const built = await buildIndex(files, prev, {
+    full: force || !sameModel,
+    force: changed,
+    model: cfg.model,
+    dim: cfg.dim,
+    embed: (texts) => embedTexts(texts, cfg),
+  });
+  writeIndex(MEM, built);
+  return { idx: { manifest: built.manifest, segments: built.segments, vectors: built.vectorsFromBuffer || vecsOf(built) }, rebuilt: true, degraded: false, stats: built.stats };
+}
+
+/** 把 buildIndex 的 buffer 还原成 Float32Array 列表，避免再读一次盘。 */
+function vecsOf(built) {
+  const dim = built.manifest.dim;
+  const out = [];
+  for (let i = 0; i < built.segments.length; i += 1) {
+    const slice = built.buffer.subarray(i * dim * 4, (i + 1) * dim * 4);
+    out.push(new Float32Array(slice.buffer.slice(slice.byteOffset, slice.byteOffset + slice.byteLength)));
+  }
+  return out;
+}
+
+/**
+ * 混合检索：BM25（字面）+ 余弦（语义）→ RRF 融合。
+ * 只回「名称 · 分 · 一行摘要 · 指针」，正文留给 memory_read——这是控制上下文的命门。
+ */
+async function hybridSearch(rawQuery, opts = {}) {
+  const query = String(rawQuery || '').trim();
+  if (!query) throw new Error('query 不能为空：拿你正想查的事、或者记忆里出现过的词来搜');
+  const k = Math.min(20, Math.max(1, Number(opts.k) || 5));
+  const started = Date.now();
+  const { idx, rebuilt, degraded, reason, stats } = await ensureIndex();
+  if (!idx.segments.length) {
+    throw new Error(`索引还是空的${degraded ? `（${reason}）` : ''}：先用面板「重建索引」或跑 node tools/reindex.mjs`);
+  }
+  const segs = idx.segments;
+  const docs = segs.map((seg) => ({
+    id: seg.id,
+    text: `${seg.name} ${seg.keywords || ''} ${seg.heading || ''} ${seg.text}`,
+  }));
+  const lists = [];
+  const mode = String(opts.mode || 'auto');
+  const useBm25 = mode !== 'vector';
+  const useVector = mode !== 'bm25';
+  const bm25 = useBm25 ? bm25Rank(docs, query, { limit: 12 }) : [];
+  if (bm25.length) lists.push(bm25);
+
+  let vectorUsed = false;
+  const cfg = resolveEmbedConfig();
+  if (useVector && cfg.apiKey && idx.vectors.length) {
+    try {
+      const [qvec] = await embedTexts([query], cfg);
+      const byId = new Map(segs.map((seg, i) => [seg.id, idx.vectors[i]]));
+      const vecRank = cosineRank(
+        [...byId.entries()].map(([id, vec]) => ({ id, vec })),
+        qvec,
+        { limit: 12, minScore: Number(opts.minScore) || 0 },
+      );
+      if (vecRank.length) lists.push(vecRank);
+      vectorUsed = true;
+    } catch (err) {
+      // 语义一路挂了就只交字面结果，别把整次检索搞崩
+      lists.push([]);
+      logPluginError('search:embed', err);
+    }
+  }
+  const fused = rrfFuse(lists, { limit: k * 4 });
+  const byId = new Map(segs.map((seg) => [seg.id, seg]));
+  // 同一份记忆可能有多段（遗留的超 2000 字条目才切段）：只留最高名次的那段，别让一条记忆占满结果。
+  const seen = new Set();
+  const picked = [];
+  for (const hit of fused) {
+    const seg = byId.get(hit.id);
+    if (!seg || seen.has(seg.name)) continue;
+    seen.add(seg.name);
+    picked.push(hit);
+    if (picked.length >= k) break;
+  }
+  const results = picked.map((hit) => {
+    const seg = byId.get(hit.id);
+    return {
+      name: seg.name,
+      file: seg.file,
+      score: Number(hit.score.toFixed(5)),
+      ranks: hit.ranks.map((r) => (r ? r.rank : null)),
+      summary: oneLineSummary(seg.keywords || seg.text, 80),
+      snippet: oneLineSummary(seg.text, 120),
+    };
+  });
+  return {
+    query,
+    k,
+    results,
+    mode: vectorUsed ? 'bm25+vector' : 'bm25',
+    degraded: !vectorUsed,
+    rebuilt,
+    stats,
+    ms: Date.now() - started,
+  };
 }
 
 function searchMemories(rawQuery) {
@@ -2777,6 +2911,62 @@ export function apply(ctx) {
       'memory read tool',
     );
 
+    // 找记忆：语义 + 字面，只回指针不吐正文（2.0 阶段三）。
+    toolCtx.effect(
+      () =>
+        toolSink.register({
+          name: 'memory_search',
+          description:
+            '按意思找记忆：给一句话或几个词，回最像的几条（名称 · 分 · 一行摘要 · 怎么读）。它只给指针，正文要用 memory_read 取。' +
+            '什么时候用：想不起哪条记忆管这事、关键词对不上、或者要确认「以前是不是记过」。索引不存在或正文改过会自动重建（首次约 7 秒）。',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', description: '要查的事，或记忆里可能出现的词。中英混排都可以。' },
+              k: { type: 'integer', description: '要几条，默认 5，最多 20。' },
+              mode: {
+                type: 'string',
+                enum: ['auto', 'bm25', 'vector'],
+                description: 'auto=字面+语义融合（默认）；bm25=只按字面（快、不花钱）；vector=只按语义。',
+              },
+              min_score: { type: 'number', description: '语义模式下的最低余弦，默认 0（不设门槛）。' },
+            },
+            required: ['query'],
+            additionalProperties: false,
+          },
+          output: {
+            schema: {
+              type: 'object',
+              properties: { text: { type: 'string' } },
+              required: ['text'],
+              additionalProperties: false,
+            },
+            render(_args, value) {
+              return [{ type: 'text', text: String(value?.text ?? '') }];
+            },
+          },
+          async execute(args) {
+            const out = await hybridSearch(args?.query, {
+              k: args?.k,
+              mode: args?.mode,
+              minScore: args?.min_score,
+            });
+            if (!out.results.length) {
+              return { text: `没搜到跟「${out.query}」相近的记忆（${out.mode}，${out.ms}ms）。换个说法，或直接 memory_read 大纲里那几条。` };
+            }
+            const lines = out.results.map((r, i) => {
+              const hint = r.ranks[0] && r.ranks[1] ? `字面 ${r.ranks[0]} / 语义 ${r.ranks[1]}` : r.ranks[0] ? `字面 ${r.ranks[0]}` : `语义 ${r.ranks[1] || '-'}`;
+              return `${i + 1}. ${r.name}（${r.score}，${hint}）—— ${r.summary}\n   读它：memory_read {"file":"${r.name}"}`;
+            });
+            const meta = `${out.mode}${out.degraded ? '·降级' : ''}${out.rebuilt ? '·刚重建索引' : ''}，${out.ms}ms`;
+            return {
+              text: `找到 ${out.results.length} 条（${meta}）：\n\n${lines.join('\n')}\n\n（这里只有摘要，要正文用 memory_read。别只凭摘要下结论。）`,
+            };
+          },
+        }),
+      'memory search tool',
+    );
+
     // 查项目记忆的原始上下文：默认只回元信息，读正文要显式 offset/limit。
     toolCtx.effect(
       () =>
@@ -3300,7 +3490,17 @@ export function apply(ctx) {
             if (req.method !== 'POST') return sendJson(res, 405, { error: 'method' });
             try {
               const body = JSON.parse(await readBody(req));
-              sendJson(res, 200, searchMemories(String(body.q || '')));
+              const base = searchMemories(String(body.q || ''));
+              // 面板输入框两边都要：字面（快、即时）+ 语义（慢一点，但能按意思找）
+              let hybrid = null;
+              if (String(body.q || '').trim() && body.hybrid !== false) {
+                try {
+                  hybrid = await hybridSearch(String(body.q || ''), { k: Number(body.k) || 8 });
+                } catch (err) {
+                  hybrid = { error: err.message, results: [] };
+                }
+              }
+              sendJson(res, 200, { ...base, hybrid });
             } catch (err) {
               sendJson(res, 400, { error: err.message });
             }

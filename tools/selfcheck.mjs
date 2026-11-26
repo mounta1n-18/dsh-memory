@@ -102,6 +102,8 @@ buildRepo();
 process.env.DSH_HOME = HOME;
 // 待删除判决的观察期默认 100 轮；自检里把观察期压到 1 轮，才能测到「刚被看见的条目不算待删除」。
 process.env.MEMORY_JUDGE_TURNS = '1';
+// 自检绝不联网：强制走「没有 embedding Key」的降级分支
+process.env.DSH_MEMORY_NO_EMBED = '1';
 
 /** /remember 用的假转录：两条人类消息 + 一条助手消息 + 一条子代理消息（后者应被排除）。 */
 const FAKE_EVENTS = [
@@ -272,7 +274,7 @@ apply(ctx);
 console.log(`\n[1] 装载面  DSH_HOME=${HOME}`);
 eq('两段系统提示注入', state.sections.length, 2);
 ok('注入顺序 outline < tidy-status', state.sections[0].name === 'memory:outline' && state.sections[1].name === 'memory:tidy-status');
-eq('五个模型工具', [...state.tools.keys()].sort().join(','), 'memory_delete,memory_read,memory_source,memory_update,memory_write');
+eq('六个模型工具', [...state.tools.keys()].sort().join(','), 'memory_delete,memory_read,memory_search,memory_source,memory_update,memory_write');
 eq('十九条路由（含 /remember、保留、口径控制、提示词检视、重建索引、调用流水/详情与探针）', state.routes.size, 19);
 
 console.log('\n[2] 大纲不丢条目');
@@ -1550,6 +1552,63 @@ ${'文'.repeat(900)}`, category: '其它' });
   eq('默认维度 1024', cfg.dim, 1024);
 }
 
+console.log('\n[24] 2.0 检索（阶段三：BM25 + 向量 + RRF）');
+{
+  const S = await import(pathToFileURL(path.join(PKG, 'search.js')).href);
+  const terms = S.tokenize('改客户端插件 memory_search');
+  ok('中文按 2 字滑窗切词', terms.includes('插件') && terms.includes('户端'), terms.slice(0, 8).join(','));
+  ok('英文整词保留', terms.includes('memory_search'));
+
+  const docs = [
+    { id: 'a', text: '跑长命令要用 ops_bash，pnpm 在某些壳里会挂' },
+    { id: 'b', text: '删家目录之前先看教训，别用 Remove-Item -Recurse' },
+  ];
+  eq('BM25 命中排第一', S.bm25Rank(docs, 'ops_bash')[0]?.id, 'a');
+  eq('BM25 中文查询也命中', S.bm25Rank(docs, '删家目录')[0]?.id, 'b');
+  eq('BM25 完全没命中就空', S.bm25Rank(docs, 'zzz不存在的东西').length, 0);
+
+  const vectors = [
+    { id: 'x', vec: [1, 0] },
+    { id: 'y', vec: [0, 1] },
+  ];
+  eq('余弦取最像的', S.cosineRank(vectors, [1, 0])[0].id, 'x');
+  eq('minScore 门槛生效', S.cosineRank(vectors, [1, 0], { minScore: 0.9 }).length, 1);
+  eq('维度不符的向量被跳过', S.cosineRank([{ id: 'z', vec: [1] }], [1, 0]).length, 0);
+
+  const fused = S.rrfFuse([
+    [{ id: 'a', score: 9 }],
+    [
+      { id: 'b', score: 1 },
+      { id: 'a', score: 0.5 },
+    ],
+  ]);
+  eq('两路都命中的排第一', fused[0].id, 'a');
+  eq('融合后两条都在', fused.length, 2);
+  eq('融合结果带每路名次', fused[0].ranks.length, 2);
+
+  const flat = S.oneLineSummary('## 标题\n\n一句话\n\n' + '字'.repeat(200), 20);
+  ok('摘要把标题符与换行压平', !flat.includes('#') && !flat.includes('\n'), flat);
+  ok('摘要超长加省略号', flat.endsWith('…') && Array.from(flat).length === 21, `${Array.from(flat).length}`);
+
+  const tool = state.tools.get('memory_search');
+  ok('memory_search 已注册', Boolean(tool));
+  ok('search 工具要求 query', (tool.parameters.required || []).includes('query'));
+  let emptyErr = '';
+  try {
+    await tool.execute({ query: '   ' });
+  } catch (err) {
+    emptyErr = err.message;
+  }
+  ok('空 query 被拒', /query 不能为空/.test(emptyErr), emptyErr);
+  let noIdx = '';
+  try {
+    await tool.execute({ query: '删家目录' });
+  } catch (err) {
+    noIdx = err.message;
+  }
+  ok('没索引时给出可操作提示', /索引还是空的|没找到|embedding/.test(noIdx), noIdx);
+}
+
 if (process.env.DUMP_PROMPTS) {
   const inv = await call(state, '/dsh-memory/prompts');
   const lines = [
@@ -1570,6 +1629,7 @@ if (process.env.DUMP_PROMPTS) {
     '工具·memory_source',
     '工具·memory_write',
     '工具·memory_update',
+    '工具·memory_search',
     '工具·memory_delete',
   ];
   const once = inv.body.items.filter((it) => always.includes(it.id));

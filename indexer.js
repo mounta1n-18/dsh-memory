@@ -317,6 +317,16 @@ export function writeIndex(memDir, built) {
 
 /** 从本机百炼配置里取 key（只读，不外传；返回时打码）。 */
 export function resolveEmbedConfig(env = process.env) {
+  // 离线自检用：强制「没有 Key」的分支，免得测试真去调百炼
+  if (env.DSH_MEMORY_NO_EMBED === '1') {
+    return {
+      apiKey: '',
+      baseUrl: EMBED_DEFAULTS.baseUrl,
+      model: env.DSH_MEMORY_EMBED_MODEL || EMBED_DEFAULTS.model,
+      dim: Number(env.DSH_MEMORY_EMBED_DIM || EMBED_DEFAULTS.dim) || EMBED_DEFAULTS.dim,
+      masked: '',
+    };
+  }
   let apiKey = env.DSH_MEMORY_EMBED_KEY || '';
   let baseUrl = env.DSH_MEMORY_EMBED_BASE || '';
   if (!apiKey) {
