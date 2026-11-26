@@ -274,7 +274,7 @@ apply(ctx);
 console.log(`\n[1] 装载面  DSH_HOME=${HOME}`);
 eq('两段系统提示注入', state.sections.length, 2);
 ok('注入顺序 outline < tidy-status', state.sections[0].name === 'memory:outline' && state.sections[1].name === 'memory:tidy-status');
-eq('六个模型工具', [...state.tools.keys()].sort().join(','), 'memory_delete,memory_read,memory_search,memory_source,memory_update,memory_write');
+eq('八个模型工具', [...state.tools.keys()].sort().join(','), 'memory_delete,memory_organize,memory_read,memory_reindex,memory_search,memory_source,memory_update,memory_write');
 eq('十九条路由（含 /remember、保留、口径控制、提示词检视、重建索引、调用流水/详情与探针）', state.routes.size, 19);
 
 console.log('\n[2] 大纲不丢条目');
@@ -1699,6 +1699,35 @@ console.log('\n[25] 2.0 自动召回（阶段四）');
   T.resetRecall();
 }
 
+console.log('\n[26] 2.0 整理体检与索引重建（阶段五）');
+{
+  eq('两条新工具都注册了', ['memory_organize', 'memory_reindex'].every((n) => state.tools.has(n)), true);
+  const organize = state.tools.get('memory_organize');
+  ok('organize 默认 dry_run', /dry_run/.test(JSON.stringify(organize.parameters)) && /只出提案/.test(organize.description));
+
+  const dry = await T.organizeMemories({ dryRun: true });
+  ok('体检会报条数', /^体检 \d+ 条/.test(dry.text), dry.text.split('\n')[0]);
+  ok('四类提案都列出来', ['合并', '拆分', '删除', '补边'].every((k) => dry.text.includes(k)));
+  ['merge', 'split', 'link', 'drop'].forEach((k) => ok(`提案字段 ${k} 是数组`, Array.isArray(dry.proposals[k])));
+
+  const scoped = await T.organizeMemories({ dryRun: true, scope: '教训' });
+  ok('scope 只数教训', /（范围：教训）/.test(scoped.text), scoped.text.split('\n')[0]);
+
+  const applied = await T.organizeMemories({ dryRun: false });
+  ok('dry_run=false 会说清自己做了什么', /已补|没有可自动补的关系边/.test(applied.text));
+
+  let noKey = '';
+  try {
+    await T.reindexMemory({});
+  } catch (err) {
+    noKey = String(err && err.message);
+  }
+  ok('没有 Key 时重建会明确拒绝', /没有 embedding Key/.test(noKey), noKey.slice(0, 40));
+
+  const S2 = await import(pathToFileURL(path.join(PKG, 'store.js')).href);
+  eq('契约里仍是 8 个工具（organize/reindex 已实装）', S2.TOOL_NAMES.length, 8);
+}
+
 if (process.env.DUMP_PROMPTS) {
   const inv = await call(state, '/dsh-memory/prompts');
   const lines = [
@@ -1720,6 +1749,8 @@ if (process.env.DUMP_PROMPTS) {
     '工具·memory_write',
     '工具·memory_update',
     '工具·memory_search',
+    '工具·memory_reindex',
+    '工具·memory_organize',
     '工具·memory_delete',
   ];
   const once = inv.body.items.filter((it) => always.includes(it.id));

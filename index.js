@@ -10,8 +10,8 @@ import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { spawn } from 'node:child_process';
-import { buildIndex, embedTexts, hashText, readIndex, resolveEmbedConfig, stripFrontmatter, writeIndex } from './indexer.js';
-import { MEMORY_BODY_MAX } from './store.js';
+import { buildIndex, embedTexts, hashText, l2normalize, readIndex, resolveEmbedConfig, stripFrontmatter, writeIndex } from './indexer.js';
+import { MEMORY_BODY_MAX, bodyChars } from './store.js';
 import { bm25Rank, cosineRank, oneLineSummary, rrfFuse } from './search.js';
 
 export const name = 'dsh-memory';
@@ -1384,6 +1384,148 @@ function vecsOf(built) {
     out.push(new Float32Array(slice.buffer.slice(slice.byteOffset, slice.byteOffset + slice.byteLength)));
   }
   return out;
+}
+
+/**
+ * 2.0 阶段五：显式重建索引。`names` 只重算这几条（其余复用旧向量），`full` 全部重算。
+ * 与 ensureIndex 的区别：这里不看哈希、不自动判断，调用方要什么就给什么。
+ */
+async function reindexMemory({ full = false, names = [] } = {}) {
+  const cfg = resolveEmbedConfig();
+  if (!cfg.apiKey) {
+    throw new Error('没有 embedding Key（~/.bailian/config.json 的 api_key，或环境变量 DSH_MEMORY_EMBED_KEY）：重建不了索引，先用 mode=bm25 走字面检索');
+  }
+  const all = readEntries().filter((e) => e.enabled);
+  const wanted = (Array.isArray(names) ? names : [])
+    .map((n) => String(n || '').trim().replace(/\.md$/, ''))
+    .filter(Boolean);
+  const known = all.map((e) => e.file.replace(/\.md$/, ''));
+  const unknown = wanted.filter((n) => !known.includes(n));
+  if (unknown.length) {
+    throw new Error(`没有这几条记忆：${unknown.join('、')}。现在索引里有：${known.slice(0, 12).join('、')}${known.length > 12 ? '…' : ''}`);
+  }
+  const files = [];
+  for (const entry of all) {
+    const body = readMemoryBody(entry.file);
+    if (!body.trim()) continue;
+    const name = entry.file.replace(/\.md$/, '');
+    const head = String(entry.keywords || '')
+      .split('/')[0]
+      .trim();
+    files.push({
+      name,
+      file: entry.file,
+      body,
+      summary: entry.keywords || '',
+      keywords: entry.keywords || '',
+      category: CATEGORIES.includes(head) ? head : '其它',
+    });
+  }
+  if (!files.length) throw new Error('没有可索引的记忆');
+  const built = await buildIndex(files, readIndex(MEM), {
+    full: Boolean(full),
+    force: wanted,
+    model: cfg.model,
+    dim: cfg.dim,
+    embed: (texts) => embedTexts(texts, cfg),
+  });
+  writeIndex(MEM, built);
+  return built.stats;
+}
+
+const ORGANIZE_MERGE_COS = 0.85;
+const ORGANIZE_LINK_COS = 0.7;
+
+/**
+ * 2.0 阶段五：整理体检。默认只出提案（dry_run），不碰任何正文。
+ * 只自动做「不破坏信息」的那件事：给近邻补关系边；合并/拆分/删除一律留给人或模型决定。
+ */
+async function organizeMemories({ dryRun = true, scope = '' } = {}) {
+  const snap = snapshot();
+  const scopeText = String(scope || '').trim().replace(/\.md$/, '');
+  const inScope = (entry) => {
+    if (!scopeText) return true;
+    const name = stemOf(entry.file);
+    const cat = String(entry.keywords || '')
+      .split('/')[0]
+      .trim();
+    return name === scopeText || entry.file.startsWith(scopeText) || cat === scopeText;
+  };
+  const entries = snap.entries.filter((e) => e.enabled && inScope(e));
+  const names = new Set(entries.map((e) => stemOf(e.file)));
+  const proposals = { merge: [], split: [], link: [], drop: [] };
+
+  for (const entry of entries) {
+    const name = stemOf(entry.file);
+    const chars = bodyChars(readMemoryBody(entry.file));
+    if (chars > MEMORY_BODY_MAX) proposals.split.push({ name, chars });
+    if (entry.pendingDelete) proposals.drop.push({ name, ageTurns: entry.ageTurns, hits: entry.hits || 0 });
+  }
+
+  let degraded = false;
+  try {
+    const { idx, degraded: deg } = await ensureIndex();
+    degraded = Boolean(deg);
+    const acc = new Map();
+    idx.segments.forEach((seg, i) => {
+      if (!names.has(seg.name)) return;
+      const vec = idx.vectors[i];
+      if (!vec) return;
+      const slot = acc.get(seg.name) || { sum: new Array(vec.length).fill(0), n: 0 };
+      for (let d = 0; d < vec.length; d += 1) slot.sum[d] += vec[d];
+      slot.n += 1;
+      acc.set(seg.name, slot);
+    });
+    const unit = new Map();
+    for (const [name, slot] of acc) unit.set(name, l2normalize(slot.sum.map((x) => x / slot.n)));
+    const links = readLinks();
+    const list = [...unit.keys()].sort();
+    for (let i = 0; i < list.length; i += 1) {
+      for (let j = i + 1; j < list.length; j += 1) {
+        const a = list[i];
+        const b = list[j];
+        const va = unit.get(a);
+        const vb = unit.get(b);
+        let dot = 0;
+        for (let d = 0; d < va.length; d += 1) dot += va[d] * vb[d];
+        const cos = Number(dot.toFixed(3));
+        if (cos >= ORGANIZE_MERGE_COS) proposals.merge.push({ a, b, cos });
+        else if (cos >= ORGANIZE_LINK_COS && !(links[a] && links[a][b])) proposals.link.push({ a, b, cos });
+      }
+    }
+  } catch (err) {
+    degraded = true;
+    logPluginError('organize:index', err);
+  }
+
+  const applied = [];
+  if (!dryRun) {
+    for (const item of proposals.link) {
+      addLink(`${item.a}.md`, `${item.b}.md`, `向量近邻 ${item.cos}`);
+      applied.push(`${item.a} ↔ ${item.b}`);
+    }
+    if (applied.length) {
+      try {
+        await reindexMemory({});
+      } catch (err) {
+        logPluginError('organize:reindex', err);
+      }
+    }
+  }
+
+  const lines = [
+    `体检 ${entries.length} 条${scopeText ? `（范围：${scopeText}）` : ''}${degraded ? '·语义路降级，只看了正文与关系边' : ''}`,
+    `· 合并 ${proposals.merge.length} 对：${proposals.merge.slice(0, 5).map((m) => `${m.a} × ${m.b}（${m.cos}）`).join('；') || '无'}`,
+    `· 拆分 ${proposals.split.length} 条：${proposals.split.slice(0, 5).map((m) => `${m.name}（${m.chars} 字）`).join('；') || '无'}`,
+    `· 删除 ${proposals.drop.length} 条：${proposals.drop.slice(0, 5).map((m) => `${m.name}（${m.ageTurns} 轮 · ${m.hits} 次回忆）`).join('；') || '无'}`,
+    `· 补边 ${proposals.link.length} 条：${proposals.link.slice(0, 5).map((m) => `${m.a} → ${m.b}（${m.cos}）`).join('；') || '无'}`,
+  ];
+  if (dryRun) {
+    lines.push('', '（dry_run：只体检，没动文件。合并要读全文再 memory_update + append:true；拆分要拆成两条；删除用 memory_delete；补边可以 dry_run=false 让我一次做完。）');
+  } else {
+    lines.push('', applied.length ? `已补 ${applied.length} 条关系边并重建索引；合并/拆分/删除仍然只出提案，动手得你自己来。` : '没有可自动补的关系边；合并/拆分/删除仍然只出提案。');
+  }
+  return { text: lines.join('\n'), proposals, applied, degraded };
 }
 
 /**
@@ -3093,6 +3235,79 @@ export function apply(ctx) {
       'memory search tool',
     );
 
+    // 重建索引：改了正文、换了 embedding 模型、或索引坏了时手动来一发。
+    toolCtx.effect(
+      () =>
+        toolSink.register({
+          name: 'memory_reindex',
+          description:
+            '重建记忆索引（一条记忆一个向量）。平时不用管：写入后和每次检索前都会自动增量重建，这个工具只用于「索引看起来不对」的时候——' +
+            '换了 embedding 模型、手动改过 .md、或者检索结果明显不对。names 只重算指定的几条，full=true 全部重算（全库约 5 万字体量 ≈0.02 元、70 秒）。',
+          parameters: {
+            type: 'object',
+            properties: {
+              full: { type: 'boolean', description: 'true=忽略缓存全部重算；默认只补缺失与改过的。' },
+              names: { type: 'array', items: { type: 'string' }, description: '只重建这几条（名称，可带或不带 .md）。' },
+            },
+            additionalProperties: false,
+          },
+          output: {
+            schema: {
+              type: 'object',
+              properties: { text: { type: 'string' } },
+              required: ['text'],
+              additionalProperties: false,
+            },
+            render(_args, value) {
+              return [{ type: 'text', text: String(value?.text ?? '') }];
+            },
+          },
+          async execute(args) {
+            const stats = await reindexMemory({ full: Boolean(args?.full), names: args?.names || [] });
+            return {
+              text:
+                `索引已重建：${stats.files} 条记忆 / ${stats.segments} 段｜新嵌入 ${stats.embedded}｜复用 ${stats.reused}｜${stats.dim} 维 ${stats.model}｜${stats.ms}ms`,
+            };
+          },
+        }),
+      'memory reindex tool',
+    );
+
+    // 整理体检：默认只出提案，dry_run=false 只做「补关系边」这种不破坏信息的事。
+    toolCtx.effect(
+      () =>
+        toolSink.register({
+          name: 'memory_organize',
+          description:
+            '给整个记忆库做体检：哪些条目该合并（向量高度相似）、哪些超长该拆、哪些该删（长期没人回忆）、哪些该补关系边。' +
+            '默认 dry_run，只出提案不动文件；dry_run=false 只会自动补关系边并重建索引，合并/拆分/删除永远要你自己用 memory_update / memory_delete 做。',
+          parameters: {
+            type: 'object',
+            properties: {
+              dry_run: { type: 'boolean', description: '默认 true：只体检。false：顺手把「补关系边」这一类不破坏信息的事做掉。' },
+              scope: { type: 'string', description: '只看某个分类（教训/资料/说明书/项目记忆/其它）或某个名称前缀。' },
+            },
+            additionalProperties: false,
+          },
+          output: {
+            schema: {
+              type: 'object',
+              properties: { text: { type: 'string' } },
+              required: ['text'],
+              additionalProperties: false,
+            },
+            render(_args, value) {
+              return [{ type: 'text', text: String(value?.text ?? '') }];
+            },
+          },
+          async execute(args) {
+            const out = await organizeMemories({ dryRun: args?.dry_run !== false, scope: args?.scope });
+            return { text: out.text };
+          },
+        }),
+      'memory organize tool',
+    );
+
     // 查项目记忆的原始上下文：默认只回元信息，读正文要显式 offset/limit。
     toolCtx.effect(
       () =>
@@ -3812,6 +4027,10 @@ export const __test = {
   OUTLINE_HOT_HITS,
   OUTLINE_COLD_KW_MAX,
   hybridSearch,
+  reindexMemory,
+  organizeMemories,
+  ORGANIZE_MERGE_COS,
+  ORGANIZE_LINK_COS,
   shouldAutoRecall,
   lastUserText,
   recallBlock,
