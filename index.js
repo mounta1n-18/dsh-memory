@@ -1408,7 +1408,10 @@ async function hybridSearch(rawQuery, opts = {}) {
   const mode = String(opts.mode || 'auto');
   const useBm25 = mode !== 'vector';
   const useVector = mode !== 'bm25';
+  const cosById = new Map();
+  const bm25ById = new Map();
   const bm25 = useBm25 ? bm25Rank(docs, query, { limit: 12 }) : [];
+  for (const hit of bm25) bm25ById.set(hit.id, Number(hit.score.toFixed(2)));
   if (bm25.length) lists.push(bm25);
 
   let vectorUsed = false;
@@ -1422,6 +1425,7 @@ async function hybridSearch(rawQuery, opts = {}) {
         qvec,
         { limit: 12, minScore: Number(opts.minScore) || 0 },
       );
+      for (const hit of vecRank) cosById.set(hit.id, Number(hit.score.toFixed(4)));
       if (vecRank.length) lists.push(vecRank);
       vectorUsed = true;
     } catch (err) {
@@ -1448,6 +1452,8 @@ async function hybridSearch(rawQuery, opts = {}) {
       name: seg.name,
       file: seg.file,
       score: Number(hit.score.toFixed(5)),
+      cos: cosById.get(hit.id) || 0,
+      bm25: bm25ById.get(hit.id) || 0,
       ranks: hit.ranks.map((r) => (r ? r.rank : null)),
       summary: oneLineSummary(seg.keywords || seg.text, 80),
       snippet: oneLineSummary(seg.text, 120),
@@ -2804,6 +2810,118 @@ function revealFile(file) {
   return abs;
 }
 
+/**
+ * 2.0 阶段四：自动召回。
+ *
+ * 为什么不用 systemPrompt.context 做这件事：那段是缓存前缀，每轮换内容等于每轮重新计费；
+ * 召回结果必须落在「用户这条消息之后」，所以只能在 agent/pre-step 里往消息数组追加。
+ */
+const RECALL_TIMEOUT_MS = 600;
+const RECALL_K = 3;
+const RECALL_MIN_COS = 0.5;
+const RECALL_MIN_BM25 = 8;
+const RECALL_MARK = '【记忆召回·自动】';
+let recallImpl = null; // 自检注入用；生产走 hybridSearch
+let lastRecallKey = '';
+
+/** 这一句值得去搜吗：太短、纯符号、以 / 开头（命令）、已经在召回块里的都跳过。 */
+function shouldAutoRecall(prompt) {
+  const text = String(prompt || '').trim();
+  if (!text || text.length < 4) return false;
+  if (text.startsWith('/')) return false;
+  if (text.includes(RECALL_MARK)) return false;
+  if (/^[\s\p{P}\p{S}]+$/u.test(text)) return false;
+  // 只有客套话（嗯/好/继续/谢谢）就不必打扰索引
+  if (/^(嗯+|哦+|好|好的|可以|行|继续|谢谢|多谢|ok|okay|收到|明白)[。！!.\s]*$/i.test(text)) return false;
+  return true;
+}
+
+/** 从 agent/pre-step 的 decision 里找最后一条用户消息的纯文本。 */
+function lastUserText(messages) {
+  if (!Array.isArray(messages)) return '';
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const msg = messages[i];
+    if (!msg || msg.role !== 'user') continue;
+    const blocks = Array.isArray(msg.content) ? msg.content : [];
+    const text = blocks
+      .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+      .map((b) => b.text)
+      .join('\n')
+      .trim();
+    if (text) return text;
+  }
+  return '';
+}
+
+/** 超时就当没有——宁可这一轮没召回，也不能拖慢回答。 */
+function withTimeout(promise, ms) {
+  let timer = null;
+  const guard = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+    if (typeof timer?.unref === 'function') timer.unref();
+  });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+}
+
+/** 召回块：只给名字 + 一行摘要 + 指针，约 120 token。 */
+function recallBlock(results) {
+  const picked = (results || []).slice(0, RECALL_K).filter((r) => r && r.name);
+  if (!picked.length) return '';
+  const lines = picked.map((r) => `· ${r.name} —— ${r.summary || ''}`.trim());
+  return `${RECALL_MARK}按你这句话自动检索了几条，可能是你要的：\n${lines.join('\n')}\n要正文用 memory_read（可一次传多个）；都不相关就忽略这一块。`;
+}
+
+async function recallForPrompt(prompt) {
+  const run = recallImpl || hybridSearch;
+  const out = await run(prompt, { k: RECALL_K, mode: 'auto' });
+  const results = (out && out.results) || [];
+  if (!results.length) return '';
+  // 门槛只看原始分数，不看 RRF 名次：RRF 总会给某人第一名，拿名次当强度等于没有门槛。
+  // 实测（41 条真实索引）：相关提问 cos 0.56~0.67、无关提问 cos 0.26~0.31，取 0.5 有安全边际；
+  // 语义路不可用（无 Key / 索引降级）时退回字面分 bm25 >= 8（相关 4.9~17.7，噪音 ≤7.2）。
+  const top = results[0];
+  const cos = Number(top.cos || 0);
+  const bm25 = Number(top.bm25 || 0);
+  const vectorUsed = cos > 0;
+  const strong = vectorUsed ? cos >= RECALL_MIN_COS : bm25 >= RECALL_MIN_BM25;
+  if (!strong) return '';
+  const kept = results.filter((r) => (vectorUsed ? Number(r.cos || 0) >= RECALL_MIN_COS - 0.05 : Number(r.bm25 || 0) >= RECALL_MIN_BM25 / 2));
+  if (!kept.length) return '';
+  return recallBlock(kept);
+}
+
+/** agent/pre-step：把召回块追加到最后一条用户消息内容的末尾。 */
+async function autoRecallListener(_payload, next) {
+  const decision = await next();
+  if (!decision || typeof decision !== 'object' || decision.kind !== 'enter') return decision;
+  try {
+    const prompt = lastUserText(decision.messages);
+    if (!shouldAutoRecall(prompt)) return decision;
+    const key = hashText(prompt);
+    if (key === lastRecallKey) return decision;
+    lastRecallKey = key;
+    const block = await withTimeout(recallForPrompt(prompt), RECALL_TIMEOUT_MS);
+    if (!block) return decision;
+    const messages = decision.messages.slice();
+    let target = -1;
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i] && messages[i].role === 'user') {
+        target = i;
+        break;
+      }
+    }
+    if (target < 0) return decision;
+    const msg = messages[target];
+    const content = Array.isArray(msg.content) ? msg.content.slice() : [];
+    content.push({ type: 'text', text: block });
+    messages[target] = { ...msg, content };
+    return { ...decision, messages };
+  } catch (err) {
+    logPluginError('auto-recall', err);
+    return decision;
+  }
+}
+
 export function apply(ctx) {
   // 轮计数：人类每发一条消息算一轮（用户口径：按一次回车算一轮）。
   // 用 session/event 的 user/message，而不是 agent/turn-stopping：
@@ -2826,6 +2944,14 @@ export function apply(ctx) {
       }),
     'memory turn counter',
   );
+
+  // 2.0 阶段四：每轮开头发一条召回候选（600ms 超时，失败静默）。宿主没有 Agent 循环就没有这个事件。
+  if (typeof ctx.on === 'function') {
+    ctx.effect(
+      () => ctx.on('agent/pre-step', autoRecallListener, { global: true }),
+      'memory auto recall',
+    );
+  }
 
   // 真实注入的大纲：文件名 + 关键词，取自 MEMORY.md，改文件即改上下文。
   ctx.effect(
@@ -3685,4 +3811,19 @@ export const __test = {
   outlineText,
   OUTLINE_HOT_HITS,
   OUTLINE_COLD_KW_MAX,
+  hybridSearch,
+  shouldAutoRecall,
+  lastUserText,
+  recallBlock,
+  autoRecallListener,
+  RECALL_MARK,
+  RECALL_TIMEOUT_MS,
+  RECALL_MIN_COS,
+  RECALL_MIN_BM25,
+  setRecallImpl(fn) {
+    recallImpl = fn;
+  },
+  resetRecall() {
+    lastRecallKey = '';
+  },
 };

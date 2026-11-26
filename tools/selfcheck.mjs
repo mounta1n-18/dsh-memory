@@ -1612,6 +1612,93 @@ console.log('\n[24] 2.0 检索（阶段三：BM25 + 向量 + RRF）');
   ok('没索引时给出可操作提示', /索引还是空的|没找到|embedding/.test(noIdx), noIdx);
 }
 
+console.log('\n[25] 2.0 自动召回（阶段四）');
+{
+  ok('寒暄不值得搜', !T.shouldAutoRecall('好的') && !T.shouldAutoRecall('谢谢！'));
+  ok('斜杠命令不搜', !T.shouldAutoRecall('/remember 记一下'));
+  ok('太短不搜', !T.shouldAutoRecall('嗯'));
+  ok('已经在召回块里的不重复搜', !T.shouldAutoRecall(`${T.RECALL_MARK} 旧内容`));
+  ok('正常提问才搜', T.shouldAutoRecall('改完源码客户端没变化怎么办'));
+
+  const messages = [
+    { role: 'user', content: [{ type: 'text', text: '第一句' }] },
+    { role: 'assistant', content: [{ type: 'text', text: '答一句' }] },
+    { role: 'user', content: [{ type: 'text', text: '插件改了不生效怎么办' }] },
+  ];
+  eq('取到最后一条用户消息', T.lastUserText(messages), '插件改了不生效怎么办');
+  eq('没有用户消息就空', T.lastUserText([{ role: 'assistant', content: [] }]), '');
+
+  const block = T.recallBlock([
+    { name: 'plugin-fork-dist-not-live', summary: '教训/插件源码生效/改 dist' },
+    { name: 'pl-mcp', summary: '说明书/MCP/懒加载' },
+  ]);
+  ok('召回块带标记', block.startsWith(T.RECALL_MARK), block.slice(0, 20));
+  ok('召回块只给名字与摘要', block.includes('plugin-fork-dist-not-live —— 教训/插件源码生效/改 dist'));
+  ok('召回块指路 memory_read', /memory_read/.test(block));
+  ok('召回块说明可忽略', /不相关就忽略/.test(block));
+  eq('没结果就没有块', T.recallBlock([]), '');
+
+  T.resetRecall();
+  T.setRecallImpl(async () => ({ results: [{ name: 'pl-mem', summary: '记忆读写', ranks: [1, 1], cos: 0.62 }] }));
+  const decision = { kind: 'enter', messages: messages.map((m) => ({ ...m, content: m.content.slice() })) };
+  const out = await T.autoRecallListener({}, async () => decision);
+  const last = out.messages[out.messages.length - 1];
+  ok('召回块追加到最后一条用户消息', last.content.some((b) => b.type === 'text' && String(b.text).startsWith(T.RECALL_MARK)));
+  ok('原有消息一条没少', out.messages.length === decision.messages.length);
+  ok('原有内容还在', last.content[0].text === '插件改了不生效怎么办');
+  ok('用户角色没被改', last.role === 'user');
+  ok('其他消息未被改动', out.messages[0].content.length === 1);
+
+  const again = await T.autoRecallListener({}, async () => ({ kind: 'enter', messages: out.messages }));
+  eq('同一句话不会重复注入', again.messages[again.messages.length - 1].content.length, last.content.length);
+
+  T.resetRecall();
+  T.setRecallImpl(async () => ({ results: [] }));
+  const none = await T.autoRecallListener({}, async () => ({
+    kind: 'enter',
+    messages: [{ role: 'user', content: [{ type: 'text', text: '另一个问题' }] }],
+  }));
+  eq('没搜到就不加块', none.messages[0].content.length, 1);
+
+  T.resetRecall();
+  T.setRecallImpl(async () => {
+    throw new Error('索引坏了');
+  });
+  const broken = await T.autoRecallListener({}, async () => ({
+    kind: 'enter',
+    messages: [{ role: 'user', content: [{ type: 'text', text: '第三个问题' }] }],
+  }));
+  eq('检索抛错也不能影响对话', broken.messages[0].content.length, 1);
+
+  T.resetRecall();
+  T.setRecallImpl(async () => ({ results: [{ name: 'weak', summary: '弱命中', ranks: [null, 7], cos: 0.2 }] }));
+  const weak = await T.autoRecallListener({}, async () => ({
+    kind: 'enter',
+    messages: [{ role: 'user', content: [{ type: 'text', text: '第四个问题' }] }],
+  }));
+  eq('弱命中且只有一条就不打扰', weak.messages[0].content.length, 1);
+
+  const gate = async (results) => {
+    T.resetRecall();
+    T.setRecallImpl(async () => ({ results }));
+    const out = await T.autoRecallListener({}, async () => ({
+      kind: 'enter',
+      messages: [{ role: 'user', content: [{ type: 'text', text: '第五个问题呢' }] }],
+    }));
+    return out.messages[0].content.length - 1;
+  };
+  eq('cos 到门槛才注入（0.56）', await gate([{ name: 'a', summary: 's', ranks: [1, 3], cos: 0.56, bm25: 1 }]), 1);
+  eq('cos 不够就闭嘴（0.3）', await gate([{ name: 'a', summary: 's', ranks: [1, 1], cos: 0.3, bm25: 12 }]), 0);
+  eq('没有语义分时看字面分（bm25 12）', await gate([{ name: 'a', summary: 's', ranks: [1, 2], cos: 0, bm25: 12 }]), 1);
+  eq('字面分也不够还是闭嘴（bm25 3）', await gate([{ name: 'a', summary: 's', ranks: [1, 1], cos: 0, bm25: 3 }]), 0);
+  eq('弱邻居被一起剔掉', await gate([
+    { name: 'a', summary: 's', ranks: [1, 1], cos: 0.61, bm25: 9 },
+    { name: 'b', summary: 's', ranks: [2, 9], cos: 0.31, bm25: 1 },
+  ]), 1);
+  T.setRecallImpl(null);
+  T.resetRecall();
+}
+
 if (process.env.DUMP_PROMPTS) {
   const inv = await call(state, '/dsh-memory/prompts');
   const lines = [
