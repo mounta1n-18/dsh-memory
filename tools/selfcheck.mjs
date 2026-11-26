@@ -1397,6 +1397,62 @@ console.log('\n[21] 口径的自动/手动混合控制与删除判决的观察�
   ok('破坏性命令把「删/清理」类教训顶到最前', order.startsWith('tmp-act='), order.slice(0, 90));
 }
 
+console.log('\n[22] 2.0 仓库骨架与工具契约（阶段一）');
+{
+  const S = await import(pathToFileURL(path.join(PKG, 'store.js')).href);
+  eq('仓库骨架版本', S.STORE_VERSION, 1);
+  const contract = S.validateContracts();
+  eq('工具与路由契约没有自相矛盾', contract.errors.join('; '), '');
+  eq('冻结的工具数', S.TOOL_NAMES.length, 8);
+  eq(
+    '工具名清单',
+    S.TOOL_NAMES.join(','),
+    'memory_read,memory_source,memory_write,memory_update,memory_delete,memory_search,memory_organize,memory_reindex',
+  );
+  ok('每个工具都标了实现阶段', S.TOOL_CONTRACTS.every((t) => Number.isInteger(t.phase) && t.phase >= 1 && t.phase <= 7));
+  ok('memory_search 的 query 是必填', S.TOOL_CONTRACTS.find((t) => t.name === 'memory_search').params.query.required === true);
+  ok(
+    'memory_write 要求 dup_check（查重结论）',
+    S.TOOL_CONTRACTS.find((t) => t.name === 'memory_write').params.dup_check.required === true,
+  );
+
+  const layout = S.storeLayout('/mem');
+  eq('索引目录与正文分开', layout.root, '/mem/.index');
+  eq('清单落在 .index 下', layout.manifest, '/mem/.index/manifest.json');
+  eq('段落在 .index 下', layout.segments, '/mem/.index/segments.jsonl');
+  eq('向量落在 .index 下', layout.vectors, '/mem/.index/vectors.bin');
+
+  const man = S.emptyManifest({ model: 'text-embedding-v4', dim: 1024 });
+  const mcheck = S.validateManifest(man);
+  ok('空清单可用', mcheck.ok, mcheck.errors.join('; '));
+  ok('清单记了模型与维度', man.model === 'text-embedding-v4' && man.dim === 1024);
+  ok('清单声明 L2 归一化 + 余弦', man.normalize === 'l2' && man.metric === 'cosine');
+  const bad = S.validateManifest({ ...man, dim: 0 });
+  ok('坏清单被拒（dim=0）', !bad.ok && bad.errors.some((e) => /dim/.test(e)), bad.errors.join('; '));
+  const badFile = S.validateManifest({ ...man, files: { 'a.txt': { hash: 'x', segments: [] } } });
+  ok('清单只收 .md', !badFile.ok && badFile.errors.some((e) => /\.md/.test(e)), badFile.errors.join('; '));
+
+  const seg = S.makeSegment({
+    name: 'demo',
+    file: 'demo.md',
+    ordinal: 1,
+    heading: '示例小节',
+    text: '一段用于验证段记录形状的正文。',
+    hash: 'abcdef1234567890',
+    keywords: '示例/骨架',
+    category: '其它',
+  });
+  ok('段记录形状可用', S.validateSegment(seg).ok, S.validateSegment(seg).errors.join('; '));
+  eq('段 id = 名称#序号@哈希前 8 位', seg.id, 'demo#001@abcdef12');
+  eq('段里记了字数', seg.chars, Array.from('一段用于验证段记录形状的正文。').length);
+  ok('没算向量时 voff 为 null', seg.voff === null && seg.vlen === 0);
+  eq(
+    '嵌入文本 = 名称|分类|摘要|小节标题 + 正文',
+    S.embedText({ name: 'demo', category: '教训', summary: '删家目录前必读', heading: '为什么', text: '正文' }),
+    'demo | 教训 | 删家目录前必读 | 为什么\n正文',
+  );
+}
+
 if (process.env.DUMP_PROMPTS) {
   const inv = await call(state, '/dsh-memory/prompts');
   const lines = [
