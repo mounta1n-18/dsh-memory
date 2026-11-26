@@ -8,6 +8,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import zlib from 'node:zlib';
 import { spawn } from 'node:child_process';
 import { buildIndex, embedTexts, hashText, l2normalize, readIndex, resolveEmbedConfig, stripFrontmatter, writeIndex } from './indexer.js';
@@ -2979,20 +2980,46 @@ function shouldAutoRecall(prompt) {
 }
 
 /** 从 agent/pre-step 的 decision 里找最后一条用户消息的纯文本。 */
-function lastUserText(messages) {
-  if (!Array.isArray(messages)) return '';
+/** 插件自己写进去的上下文行（source.kind 以 plugin: 开头）——绝不能当成用户说的话。 */
+function isPluginMessage(msg) {
+  const kind = msg && msg.source && typeof msg.source.kind === 'string' ? msg.source.kind : '';
+  return kind.startsWith('plugin:');
+}
+
+/** 找到最后一条「真正的用户消息」，返回 { index, text }；插件注入的行要跳过。 */
+function lastUserTurn(messages) {
+  if (!Array.isArray(messages)) return { index: -1, text: '' };
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const msg = messages[i];
-    if (!msg || msg.role !== 'user') continue;
+    if (!msg || msg.role !== 'user' || isPluginMessage(msg)) continue;
     const blocks = Array.isArray(msg.content) ? msg.content : [];
     const text = blocks
       .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
       .map((b) => b.text)
       .join('\n')
       .trim();
-    if (text) return text;
+    if (text) return { index: i, text };
   }
-  return '';
+  return { index: -1, text: '' };
+}
+
+function lastUserText(messages) {
+  return lastUserTurn(messages).text;
+}
+
+/**
+ * 把召回块做成一条**独立的插件消息**，紧跟在用户那句之后。
+ * 理由：DSH 把「同一条消息里的多个 text block」当成用户自己说的话显示在气泡里，
+ * 追加进用户消息会污染 transcript（用户看到自己的话后面多了一堆东西）。
+ * dsh-im 的上下文行也是这么做的：独立 user-role 消息 + source.kind = plugin:<name>。
+ */
+function recallMessage(text, count) {
+  return {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text: `${text}\n（这条是 dsh-memory 插件自动附的上下文，不是你发的消息。）` }],
+    source: { kind: 'plugin:dsh-memory', form: 'notice', summary: `记忆召回 ${count} 条` },
+  };
 }
 
 /** 超时就当没有——宁可这一轮没召回，也不能拖慢回答。 */
@@ -3017,7 +3044,8 @@ async function recallForPrompt(prompt) {
   const run = recallImpl || hybridSearch;
   const out = await run(prompt, { k: RECALL_K, mode: 'auto' });
   const results = (out && out.results) || [];
-  if (!results.length) return '';
+  const none = { block: '', count: 0 };
+  if (!results.length) return none;
   // 门槛只看原始分数，不看 RRF 名次：RRF 总会给某人第一名，拿名次当强度等于没有门槛。
   // 实测（41 条真实索引）：相关提问 cos 0.56~0.67、无关提问 cos 0.26~0.31，取 0.5 有安全边际；
   // 语义路不可用（无 Key / 索引降级）时退回字面分 bm25 >= 8（相关 4.9~17.7，噪音 ≤7.2）。
@@ -3026,37 +3054,30 @@ async function recallForPrompt(prompt) {
   const bm25 = Number(top.bm25 || 0);
   const vectorUsed = cos > 0;
   const strong = vectorUsed ? cos >= RECALL_MIN_COS : bm25 >= RECALL_MIN_BM25;
-  if (!strong) return '';
+  if (!strong) return none;
   const kept = results.filter((r) => (vectorUsed ? Number(r.cos || 0) >= RECALL_MIN_COS - 0.05 : Number(r.bm25 || 0) >= RECALL_MIN_BM25 / 2));
-  if (!kept.length) return '';
-  return recallBlock(kept);
+  if (!kept.length) return none;
+  return { block: recallBlock(kept), count: kept.length };
 }
 
-/** agent/pre-step：把召回块追加到最后一条用户消息内容的末尾。 */
+/** agent/pre-step：把召回块作为一条独立插件消息，插到最后一条用户消息之后。 */
 async function autoRecallListener(_payload, next) {
   const decision = await next();
   if (!decision || typeof decision !== 'object' || decision.kind !== 'enter') return decision;
   try {
-    const prompt = lastUserText(decision.messages);
-    if (!shouldAutoRecall(prompt)) return decision;
+    const turn = lastUserTurn(decision.messages);
+    const prompt = turn.text;
+    if (turn.index < 0 || !shouldAutoRecall(prompt)) return decision;
     const key = hashText(prompt);
     if (key === lastRecallKey) return decision;
-    lastRecallKey = key;
-    const block = await withTimeout(recallForPrompt(prompt), RECALL_TIMEOUT_MS);
-    if (!block) return decision;
     const messages = decision.messages.slice();
-    let target = -1;
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      if (messages[i] && messages[i].role === 'user') {
-        target = i;
-        break;
-      }
-    }
-    if (target < 0) return decision;
-    const msg = messages[target];
-    const content = Array.isArray(msg.content) ? msg.content.slice() : [];
-    content.push({ type: 'text', text: block });
-    messages[target] = { ...msg, content };
+    // 同一条用户消息后面已经有召回行就别再加（多步、重放都不会重复）
+    const next = messages[turn.index + 1];
+    if (next && isPluginMessage(next) && next.source && next.source.kind === 'plugin:dsh-memory') return decision;
+    lastRecallKey = key;
+    const found = await withTimeout(recallForPrompt(prompt), RECALL_TIMEOUT_MS);
+    if (!found || !found.block) return decision;
+    messages.splice(turn.index + 1, 0, recallMessage(found.block, found.count));
     return { ...decision, messages };
   } catch (err) {
     logPluginError('auto-recall', err);
@@ -4032,6 +4053,9 @@ export const __test = {
   ORGANIZE_MERGE_COS,
   ORGANIZE_LINK_COS,
   shouldAutoRecall,
+  lastUserTurn,
+  recallMessage,
+  isPluginMessage,
   lastUserText,
   recallBlock,
   autoRecallListener,

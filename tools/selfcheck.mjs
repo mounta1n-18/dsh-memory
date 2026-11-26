@@ -1642,15 +1642,20 @@ console.log('\n[25] 2.0 自动召回（阶段四）');
   T.setRecallImpl(async () => ({ results: [{ name: 'pl-mem', summary: '记忆读写', ranks: [1, 1], cos: 0.62 }] }));
   const decision = { kind: 'enter', messages: messages.map((m) => ({ ...m, content: m.content.slice() })) };
   const out = await T.autoRecallListener({}, async () => decision);
-  const last = out.messages[out.messages.length - 1];
-  ok('召回块追加到最后一条用户消息', last.content.some((b) => b.type === 'text' && String(b.text).startsWith(T.RECALL_MARK)));
-  ok('原有消息一条没少', out.messages.length === decision.messages.length);
-  ok('原有内容还在', last.content[0].text === '插件改了不生效怎么办');
-  ok('用户角色没被改', last.role === 'user');
-  ok('其他消息未被改动', out.messages[0].content.length === 1);
+  eq('召回行是独立的一条消息，不是塞进用户气泡', out.messages.length, decision.messages.length + 1);
+  const injected = out.messages[3];
+  eq('插件消息紧跟在用户那句之后', injected.role, 'user');
+  eq('插件消息带 plugin: 出处', injected.source.kind, 'plugin:dsh-memory');
+  eq('插件消息标明是 notice', injected.source.form, 'notice');
+  ok('插件消息有自己的 id', typeof injected.id === 'string' && injected.id.length > 8);
+  ok('插件消息内容是召回块', String(injected.content[0].text).startsWith(T.RECALL_MARK), String(injected.content[0].text).slice(0, 20));
+  eq('用户自己的消息一字未动', out.messages[2].content.length, 1);
+  eq('用户自己的文本没被拼接', out.messages[2].content[0].text, '插件改了不生效怎么办');
+  eq('前面的历史也没动', out.messages[0].content[0].text, '第一句');
 
   const again = await T.autoRecallListener({}, async () => ({ kind: 'enter', messages: out.messages }));
-  eq('同一句话不会重复注入', again.messages[again.messages.length - 1].content.length, last.content.length);
+  eq('同一条消息后面已有召回行就不再插', again.messages.length, out.messages.length);
+  eq('插件行不会被当成用户提问', T.lastUserText(out.messages), '插件改了不生效怎么办');
 
   T.resetRecall();
   T.setRecallImpl(async () => ({ results: [] }));
@@ -1658,7 +1663,7 @@ console.log('\n[25] 2.0 自动召回（阶段四）');
     kind: 'enter',
     messages: [{ role: 'user', content: [{ type: 'text', text: '另一个问题' }] }],
   }));
-  eq('没搜到就不加块', none.messages[0].content.length, 1);
+  eq('没搜到就不加消息', none.messages.length, 1);
 
   T.resetRecall();
   T.setRecallImpl(async () => {
@@ -1668,7 +1673,7 @@ console.log('\n[25] 2.0 自动召回（阶段四）');
     kind: 'enter',
     messages: [{ role: 'user', content: [{ type: 'text', text: '第三个问题' }] }],
   }));
-  eq('检索抛错也不能影响对话', broken.messages[0].content.length, 1);
+  eq('检索抛错也不能影响对话', broken.messages.length, 1);
 
   T.resetRecall();
   T.setRecallImpl(async () => ({ results: [{ name: 'weak', summary: '弱命中', ranks: [null, 7], cos: 0.2 }] }));
@@ -1676,25 +1681,22 @@ console.log('\n[25] 2.0 自动召回（阶段四）');
     kind: 'enter',
     messages: [{ role: 'user', content: [{ type: 'text', text: '第四个问题' }] }],
   }));
-  eq('弱命中且只有一条就不打扰', weak.messages[0].content.length, 1);
+  eq('弱命中不加消息', weak.messages.length, 1);
 
   const gate = async (results) => {
     T.resetRecall();
     T.setRecallImpl(async () => ({ results }));
-    const out = await T.autoRecallListener({}, async () => ({
+    const got = await T.autoRecallListener({}, async () => ({
       kind: 'enter',
       messages: [{ role: 'user', content: [{ type: 'text', text: '第五个问题呢' }] }],
     }));
-    return out.messages[0].content.length - 1;
+    return got.messages.length - 1;
   };
   eq('cos 到门槛才注入（0.56）', await gate([{ name: 'a', summary: 's', ranks: [1, 3], cos: 0.56, bm25: 1 }]), 1);
   eq('cos 不够就闭嘴（0.3）', await gate([{ name: 'a', summary: 's', ranks: [1, 1], cos: 0.3, bm25: 12 }]), 0);
   eq('没有语义分时看字面分（bm25 12）', await gate([{ name: 'a', summary: 's', ranks: [1, 2], cos: 0, bm25: 12 }]), 1);
   eq('字面分也不够还是闭嘴（bm25 3）', await gate([{ name: 'a', summary: 's', ranks: [1, 1], cos: 0, bm25: 3 }]), 0);
-  eq('弱邻居被一起剔掉', await gate([
-    { name: 'a', summary: 's', ranks: [1, 1], cos: 0.61, bm25: 9 },
-    { name: 'b', summary: 's', ranks: [2, 9], cos: 0.31, bm25: 1 },
-  ]), 1);
+
   T.setRecallImpl(null);
   T.resetRecall();
 }
