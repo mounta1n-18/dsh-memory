@@ -14,13 +14,32 @@
 export const STORE_VERSION = 1;
 export const STORE_DIRNAME = '.index';
 
-/** 段切分口径（阶段二/七会用到，先钉死） */
+/**
+ * 一条记忆的正文上限（字，按码点算）。
+ * 2026-11-26 定：2,000 字。理由不是模型塞不下（text-embedding-v4 单条 8,192 token），
+ * 而是「一条记忆 = 一个向量」之后，太长会把语义平均掉，检索分数被稀释。
+ * 超限时写入直接拒绝，逼着拆成两条（或把细节挪进附录条目）。
+ */
+export const MEMORY_BODY_MAX = 2000;
+
+/** 段切分口径：默认整条入库；只有超上限的遗留条目才退回按 `## ` 切（标 split:true）。 */
 export const SEGMENT_RULES = {
-  splitOn: '## ',
-  maxChars: 500, // 单段超过这个字数，按空行二次切
+  wholeEntry: true, // 一条记忆 = 一个向量（默认策略）
+  splitOn: '## ', // 兜底：超过 MEMORY_BODY_MAX 才切
+  maxChars: 500, // 兜底时单段超过这个字数，按空行二次切
   overlap: 0, // 不做重叠：只增体积，不增召回
   minChars: 24, // 更短的段并进上一段，避免碎句
 };
+
+export function bodyChars(body) {
+  return Array.from(String(body || '')).length;
+}
+
+/** 正文是否超上限；返回 {ok, chars, max}，方便调用方直接抛错。 */
+export function checkBodyLength(body) {
+  const chars = bodyChars(body);
+  return { ok: chars <= MEMORY_BODY_MAX, chars, max: MEMORY_BODY_MAX };
+}
 
 /** 仓库目录布局。入参是记忆根目录（默认 ~/.dsh/memory）。 */
 export function storeLayout(memDir) {
@@ -89,6 +108,7 @@ export function makeSegment(input) {
     category = '',
     voff = null,
     vlen = 0,
+    split = false,
   } = input || {};
   return {
     id: segmentId({ name, ordinal, hash }),
@@ -103,6 +123,7 @@ export function makeSegment(input) {
     category,
     voff,
     vlen,
+    split: Boolean(split), // true = 这条超了正文上限，是被迫切开的遗留条目
   };
 }
 

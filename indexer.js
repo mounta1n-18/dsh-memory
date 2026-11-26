@@ -12,7 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { embedText, makeSegment, segmentId, storeLayout, SEGMENT_RULES, emptyManifest, validateManifest } from './store.js';
+import { MEMORY_BODY_MAX, bodyChars, embedText, makeSegment, segmentId, storeLayout, SEGMENT_RULES, emptyManifest, validateManifest } from './store.js';
 
 export const EMBED_DEFAULTS = {
   model: 'text-embedding-v4',
@@ -68,33 +68,39 @@ export function hashText(text) {
 }
 
 /**
- * 一条记忆 → 若干段记录（还没算向量）。
- * entry: { name, file, body, summary?, keywords?, category? }
+ * 一条记忆 → 段记录（还没算向量）。
+ * 默认**整条入库**：一条记忆 = 一个向量，检索命中即整条，不需要再拼段。
+ * 只有超过 MEMORY_BODY_MAX 的遗留条目才退回按小节切，并标 split:true。
  */
 export function buildSegments(entry) {
   const name = String(entry.name || '').replace(/\.md$/, '');
   const file = entry.file || `${name}.md`;
   const summary = entry.summary || entry.keywords || '';
   const category = entry.category || String(entry.keywords || '').split('/')[0] || '其它';
-  const sections = splitSections(entry.body);
+  const body = String(entry.body || '');
+  const whole = Array.from(body.trim()).join('');
+  const fits = bodyChars(whole) <= MEMORY_BODY_MAX;
+  const base = { name, file, keywords: summary, category, summary };
+
+  if (fits && Array.from(whole).length >= SEGMENT_RULES.minChars) {
+    const hash = hashText(whole);
+    return [makeSegment({ ...base, ordinal: 1, heading: '', text: whole, hash })];
+  }
+
   const segs = [];
   let ordinal = 0;
-  for (const section of sections) {
+  for (const section of splitSections(body)) {
     for (const piece of splitLong(section.text)) {
       if (Array.from(piece).length < SEGMENT_RULES.minChars) continue;
       ordinal += 1;
-      const hash = hashText(`${section.heading}\n${piece}`);
       segs.push(
         makeSegment({
-          name,
-          file,
+          ...base,
           ordinal,
           heading: section.heading,
           text: piece,
-          hash,
-          keywords: summary,
-          category,
-          summary,
+          hash: hashText(`${section.heading}\n${piece}`),
+          split: true,
         }),
       );
     }

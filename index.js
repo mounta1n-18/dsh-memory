@@ -11,6 +11,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { spawn } from 'node:child_process';
 import { buildIndex, embedTexts, readIndex, resolveEmbedConfig, writeIndex } from './indexer.js';
+import { MEMORY_BODY_MAX } from './store.js';
 
 export const name = 'dsh-memory';
 
@@ -788,6 +789,20 @@ function assertName(name) {
   return n;
 }
 
+/**
+ * 2.0 的正文长度闸门：一条记忆只占一个向量，太长会把语义平均掉，写入直接拒。
+ * 这不是模型塞不下（embedding 单条 8,192 token），而是检索质量的选择。
+ */
+function assertBodyLength(body) {
+  const chars = Array.from(String(body || '')).length;
+  if (chars > MEMORY_BODY_MAX) {
+    throw new Error(
+      `这条正文 ${chars} 字，超过 ${MEMORY_BODY_MAX} 字上限（2.0 起一条记忆只占一个向量，太长检索会被稀释）：` +
+        '拆成两条（按主题分），或把细节挪进独立的附录条目，正文里用 memory_read 指路。',
+    );
+  }
+}
+
 function oneLine(value, max = 160) {
   return String(value || '')
     .replace(/[\r\n]+/g, ' ')
@@ -1208,6 +1223,7 @@ function createMemory(input) {
   assertCategory(keywords, { allowManual: true });
   if (!description) throw new Error('描述不能为空，一句话说清什么时候读');
   if (!body) throw new Error('正文不能为空');
+  assertBodyLength(body);
   // 项目记忆（人工通道）在正文最前面记来源会话，并把那场会话的原始上下文备份到 .sources。
   const session = oneLine(input?.session, 80);
   const head = sourceLine(session);
@@ -2874,6 +2890,7 @@ export function apply(ctx) {
             if (vagueProblem) throw new Error(vagueProblem);
             if (!description) throw new Error('description 不能为空，一句话说清什么时候读');
             if (!body) throw new Error('body 不能为空');
+            assertBodyLength(body);
             // 查重闸门：模型自己比关键词、必要时读全文，然后把结论写进 dup_check。
             const dupe = assertDupeReviewed(args);
             const attrs = [`name: ${name}`, `description: ${description}`, `type: ${type}`, `reviewed: ${today()}`];
@@ -2953,6 +2970,7 @@ export function apply(ctx) {
             const incoming = args?.body ? String(args.body).trim() : '';
             const body = appendMode ? (incoming ? `${doc.body}\n\n${incoming}` : doc.body) : incoming || doc.body;
             if (!body) throw new Error('body 不能为空');
+            assertBodyLength(body);
             // 关键词先校验再落盘：否则正文改了、关键词被拒，留下半截修改
             const nextKeywords = args?.keywords ? oneLine(args.keywords, 80) : '';
             if (nextKeywords) {

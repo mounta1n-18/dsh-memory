@@ -483,15 +483,37 @@ ok('拦住时给出改写提示', /写成句子了/.test(r.body?.error || ''), r
 
 // 正文长度：2000 字以内静默，超过只提一句（用户口径 2026-10-28：别用「警告」把人吓短）
 const shortBody = write.execute({ name: 'len-short', keywords: '其它/短正文静默', description: '自检', body: '甲'.repeat(600), dup_check: '只比了关键词，判为无关，新建' });
-ok('600 字静默', !/建议长度/.test(shortBody.text), shortBody.text.slice(-60));
-const longBody = write.execute({ name: 'len-long', keywords: '其它/长正文提示', description: '自检', body: '乙'.repeat(2100), dup_check: '只比了关键词，判为无关，新建' });
-ok('2100 字只提示不拦截', /建议 2000 字以内/.test(longBody.text), longBody.text.slice(-90));
-ok(
-  '提示措辞与定稿一致',
-  longBody.text.includes('提示：正文略长，排除 YAML 头共 2100 字，建议 2000 字以内。如果正文已足够简洁，可以忽略本提醒。'),
-  longBody.text.slice(-90),
-);
-ok('提示语气放轻（不写警告/超出上限）', !/警告|超出上限/.test(longBody.text), longBody.text.slice(-90));
+ok('600 字照常写入', /len-short/.test(shortBody.text), shortBody.text.slice(-60));
+let tooLong = '';
+try {
+  write.execute({ name: 'len-long', keywords: '其它/长正文提示', description: '自检', body: '乙'.repeat(2100), dup_check: '只比了关键词，判为无关，新建' });
+} catch (err) {
+  tooLong = err.message;
+}
+ok('2.0 起超过 2000 字硬拒写入', /超过 2000 字上限/.test(tooLong), tooLong);
+ok('拒绝时给出拆条建议', /拆成两条|附录条目/.test(tooLong), tooLong);
+ok('刚好 2000 字能写进去', (() => {
+  try {
+    write.execute({ name: 'len-edge', keywords: '其它/边界正文', description: '自检', body: '丙'.repeat(2000), dup_check: '只比了关键词，判为无关，新建' });
+    return true;
+  } catch {
+    return false;
+  }
+})());
+// 绕过工具直接写文件时，仍只给一句软提示（那条路不归 memory_write 管）
+fs.writeFileSync(path.join(MEM, 'len-long.md'), `---
+name: len-long
+description: 自检
+type: reference
+reviewed: ${new Date().toISOString().slice(0, 10)}
+---
+
+${'乙'.repeat(2100)}
+`, 'utf8');
+const oversizeDecision = await afterTool(state, 'write', { file_path: path.join(MEM, 'len-long.md') });
+const oversizeHint = (oversizeDecision.content || []).map((c) => c.text || '').join('\n');
+ok('直写超长文件只提示不拦', /建议 2000 字以内/.test(oversizeHint), oversizeHint.slice(-90));
+ok('提示语气放轻（不写警告/超出上限）', !/警告|超出上限/.test(oversizeHint), oversizeHint.slice(-90));
 
 console.log('\n[6] 回忆统计（轮计数 + 回忆率）');
 const userTurn = () => {
@@ -1475,28 +1497,37 @@ console.log('\n[23] 2.0 章节级索引（阶段二）');
   const fakeEmbed = (texts) => texts.map(() => Array.from({ length: dim }, () => 1 / Math.sqrt(dim)));
 
   const first = await IDX.buildIndex([alpha, beta], null, { dim, model: 'm', embed: fakeEmbed });
-  eq('两条记忆切出 3 段', first.segments.length, 3);
-  eq('首建全部嵌入', first.stats.embedded, 3);
-  eq('向量文件 = 段×维度×4 字节', first.buffer.length, 3 * dim * 4);
+  eq('一条记忆 = 一个向量', first.segments.length, 2);
+  ok('整条入库不带 split 标记', first.segments.every((seg) => seg.split === false));
+  eq('首建全部嵌入', first.stats.embedded, 2);
+  eq('向量文件 = 段×维度×4 字节', first.buffer.length, 2 * dim * 4);
   ok('清单通过校验', S.validateManifest(first.manifest).ok, S.validateManifest(first.manifest).errors.join('; '));
   ok('段里记了向量偏移', first.segments[1].voff === dim * 4 && first.segments[1].vlen === dim * 4);
+  eq('整条入库段的正文 = 全文', first.segments[0].chars, Array.from(alpha.body.trim()).length);
 
   IDX.writeIndex(memDir, first);
   const prev = IDX.readIndex(memDir);
-  eq('读回 3 段', prev.segments.length, 3);
-  ok('读回 3 条向量且维度对', prev.vectors.length === 3 && prev.vectors[0].length === dim);
+  eq('读回 2 段', prev.segments.length, 2);
+  ok('读回 2 条向量且维度对', prev.vectors.length === 2 && prev.vectors[0].length === dim);
   ok('向量已 L2 归一化', Math.abs(Math.hypot(...prev.vectors[0]) - 1) < 1e-4);
 
   const again = await IDX.buildIndex([alpha, beta], prev, { dim, model: 'm', embed: fakeEmbed });
   eq('内容没变就零嵌入', again.stats.embedded, 0);
-  eq('全部复用旧向量', again.stats.reused, 3);
+  eq('全部复用旧向量', again.stats.reused, 2);
 
   const beta2 = { ...beta, body: `## 一\n${'丁'.repeat(80)}` };
   const third = await IDX.buildIndex([alpha, beta2], prev, { dim, model: 'm', embed: fakeEmbed });
   eq('只改一条就只重算那一条', third.stats.embedded, 1);
 
   const forced = await IDX.buildIndex([alpha, beta], prev, { dim, model: 'm', embed: fakeEmbed, force: ['alpha'] });
-  eq('names 强制重算指定文件', forced.stats.embedded, 2);
+  eq('names 强制重算指定文件', forced.stats.embedded, 1);
+
+  const over = await IDX.buildSegments({ name: 'long', file: 'long.md', body: `## 一
+${'长'.repeat(1500)}
+## 二
+${'文'.repeat(900)}`, category: '其它' });
+  ok('超过 2000 字的遗留条目退回分段并标记', over.length > 1 && over.every((seg) => seg.split === true));
+  eq('正好 2000 字仍整条入库', IDX.buildSegments({ name: 'edge', file: 'edge.md', body: '字'.repeat(2000) }).length, 1);
 
   let bad = '';
   try {
