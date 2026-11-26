@@ -10,7 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { spawn } from 'node:child_process';
-import { buildIndex, embedTexts, hashText, readIndex, resolveEmbedConfig, writeIndex } from './indexer.js';
+import { buildIndex, embedTexts, hashText, readIndex, resolveEmbedConfig, stripFrontmatter, writeIndex } from './indexer.js';
 import { MEMORY_BODY_MAX } from './store.js';
 import { bm25Rank, cosineRank, oneLineSummary, rrfFuse } from './search.js';
 
@@ -1306,7 +1306,7 @@ async function reindexMemories(opts = {}) {
   }
   const files = [];
   for (const entry of readEntries()) {
-    const body = readMemoryBody(entry.file);
+    const body = stripFrontmatter(fs.readFileSync(path.join(MEM, entry.file), 'utf8'));
     if (!body.trim()) continue;
     const name = entry.file.replace(/\.md$/, '');
     const head = String(entry.keywords || '').split('/')[0].trim();

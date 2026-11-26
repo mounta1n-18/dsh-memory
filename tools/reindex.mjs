@@ -13,7 +13,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { buildIndex, embedTexts, readIndex, resolveEmbedConfig, writeIndex } from '../indexer.js';
+import { buildIndex, embedTexts, readIndex, resolveEmbedConfig, stripFrontmatter, writeIndex } from '../indexer.js';
 
 const argv = process.argv.slice(2);
 const arg = (flag, dflt = '') => {
@@ -50,7 +50,8 @@ const CATS = ['资料', '教训', '说明书', '项目记忆', '其它'];
 const files = [];
 for (const row of readEntries()) {
   if (only && !only.has(row.file.replace(/\.md$/, ''))) continue;
-  const body = fs.readFileSync(path.join(MEM, row.file), 'utf8');
+  // 与宿主 ensureIndex() 用同一份正文（去 YAML 头），否则哈希永远对不上、每次重建都全量
+  const body = stripFrontmatter(fs.readFileSync(path.join(MEM, row.file), 'utf8'));
   const head = String(row.keywords || '').split('/')[0].trim();
   files.push({
     name: row.file.replace(/\.md$/, ''),

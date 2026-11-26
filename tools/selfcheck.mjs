@@ -1507,6 +1507,9 @@ console.log('\n[23] 2.0 章节级索引（阶段二）');
   ok('段里记了向量偏移', first.segments[1].voff === dim * 4 && first.segments[1].vlen === dim * 4);
   eq('整条入库段的正文 = 全文', first.segments[0].chars, Array.from(alpha.body.trim()).length);
 
+  const rawWithHead = `---\nreviewed: 2026-01-01\nkeywords: 资料/甲/乙\n---\n${alpha.body}`;
+  eq('CLI 与宿主对同一份正文算哈希', IDX.hashText(IDX.stripFrontmatter(rawWithHead)), IDX.hashText(alpha.body.trim()));
+
   IDX.writeIndex(memDir, first);
   const prev = IDX.readIndex(memDir);
   eq('读回 2 段', prev.segments.length, 2);

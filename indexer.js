@@ -63,6 +63,13 @@ export function splitLong(text, maxChars = SEGMENT_RULES.maxChars) {
   return out;
 }
 
+/** 去掉 YAML 头（正文才是索引与嵌入的对象）；CLI 与宿主必须用同一份，否则每次都会判「变了」。 */
+export function stripFrontmatter(raw) {
+  const text = String(raw || '').replace(/^\uFEFF/, '');
+  const m = text.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/);
+  return (m ? text.slice(m[0].length) : text).trim();
+}
+
 export function hashText(text) {
   return crypto.createHash('sha1').update(String(text), 'utf8').digest('hex').slice(0, 16);
 }
