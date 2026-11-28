@@ -1748,6 +1748,37 @@ console.log('\n[27] 2.0 压缩后自动体检（阶段六）');
   ok('体检报告不进大纲', !/organize\.json|selfcheck/.test(T.outlineText()));
 }
 
+console.log('\n[28] 束稳态：目标可配 + 阈值随 PID 走');
+{
+  eq('束大小门槛默认 3', T.MERGE_BUNDLE_SIZE, 3);
+  await call(state, '/dsh-memory/control', { target: 7 });
+  eq('目标条数跟着 control.json 走（设 7 读 7）', T.pidTarget(), 7);
+
+  const setSmall = await call(state, '/dsh-memory/control', { target: 12 });
+  eq('目标条数能设成 12', setSmall.body.control.target, 12);
+  eq('状态接口读回目标', (await call(state, '/dsh-memory/status')).body.control.target, 12);
+
+  const clampLow = await call(state, '/dsh-memory/control', { target: 1 });
+  eq('目标条数下限夹到 3', clampLow.body.control.target, 3);
+  const clampHigh = await call(state, '/dsh-memory/control', { target: 9999 });
+  eq('目标条数上限夹到 500', clampHigh.body.control.target, 500);
+  await call(state, '/dsh-memory/control', { target: 50 });
+
+  // 阈值 = μ + z·σ，z 随 PID 的 u 走：u 大（条目太少）→ 阈值抬高 → 少合并
+  const mk = (u) => {
+    fs.writeFileSync(T.PID_FILE, JSON.stringify({ turn: 1e9, integral: 0, prevErr: 0, u, tier: 2, total: 40 }));
+  };
+  const thresholdAt = async (u) => {
+    mk(u);
+    const r = await T.organizeMemories({ dryRun: true });
+    return r.proposals.plan ? r.proposals.plan.threshold : null;
+  };
+  const hi = await thresholdAt(0.8);
+  const lo = await thresholdAt(-0.8);
+  ok('PID 的 u 越大，合并阈值越高（条目少 → 少合并）', hi !== null && lo !== null && hi > lo, `${hi} vs ${lo}`);
+  eq('体检摘要里写明目标条数', /目标 \d+ 条/.test((await T.organizeMemories({ dryRun: true })).text), true);
+}
+
 if (process.env.DUMP_PROMPTS) {
   const inv = await call(state, '/dsh-memory/prompts');
   const lines = [

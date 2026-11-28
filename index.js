@@ -91,7 +91,8 @@ const TIER_HITS_ADD = [0, 0, 0, 1, 1, 2]; // 淘汰所需回忆次数加码
  */
 function pidState(total) {
   const n = Math.max(0, Number(total) || 0);
-  const err = (MEM_TARGET - n) / MEM_TARGET; // 正 = 太少
+  const target = pidTarget();
+  const err = (target - n) / target; // 正 = 太少
   const st = readJson(PID_FILE, null);
   const integralPrev = Number.isFinite(st?.integral) ? st.integral : 0;
   const prevErr = Number.isFinite(st?.prevErr) ? st.prevErr : err;
@@ -105,7 +106,7 @@ function pidState(total) {
   const derivative = (err - prevErr) / dt;
   const u = clampNum(PID_KP * err + integral + PID_KD * derivative, -1, 1);
   const tier = tierOf(u);
-  writeJson(PID_FILE, { turn: turnCount, integral, prevErr: err, u, tier, total: n });
+  writeJson(PID_FILE, { turn: turnCount, integral, prevErr: err, u, tier, total: n, target });
   return { u, tier, err, integral };
 }
 
@@ -114,7 +115,14 @@ function readControl() {
   const raw = readJson(CONTROL_FILE, null);
   const mode = raw?.mode === 'manual' ? 'manual' : 'auto';
   const tier = clampNum(Math.round(Number(raw?.tier) || 3), 1, 6);
-  return { mode, tier };
+  const target = Number.isFinite(Number(raw?.target)) ? clampNum(Math.round(Number(raw.target)), 3, 500) : 0;
+  return { mode, tier, target };
+}
+
+/** 用户设定的目标条数（control.json 的 target，缺省 MEM_TARGET）。 */
+function pidTarget() {
+  const t = Number(readControl().target);
+  return Number.isFinite(t) && t >= 3 ? Math.min(500, Math.round(t)) : MEM_TARGET;
 }
 
 function writeControl(patch) {
@@ -126,7 +134,9 @@ function writeControl(patch) {
   const mode = asked === 'manual' ? 'manual' : asked === 'auto' ? 'auto' : cur.mode;
   const rawTier = Number(patch?.tier);
   const tier = Number.isFinite(rawTier) ? clampNum(Math.round(rawTier), 1, 6) : cur.tier;
-  const next = { mode, tier };
+  const rawTarget = Number(patch?.target);
+  const target = Number.isFinite(rawTarget) ? clampNum(Math.round(rawTarget), 3, 500) : cur.target;
+  const next = { mode, tier, target };
   writeJson(CONTROL_FILE, next);
   return next;
 }
@@ -1437,6 +1447,12 @@ async function reindexMemory({ full = false, names = [] } = {}) {
 
 const ORGANIZE_MERGE_COS = 0.85;
 const ORGANIZE_LINK_COS = 0.7;
+// 2.0「束」稳态：束内达到 MERGE_BUNDLE_SIZE 条就并一次（只并最像的一对），
+// 阈值由 PID 在当前数据的余弦分布上调 z 偏移——尺度无关，所以十几条时就能收敛。
+const MERGE_BUNDLE_SIZE = Math.max(2, Number(process.env.MEMORY_MERGE_BUNDLE) || 3);
+const MERGE_Z0 = Number(process.env.MEMORY_MERGE_Z0) || 0.8;
+const MERGE_Z_GAIN = 1.8;
+const MERGE_LINK_Z = 0.2;
 
 /**
  * 2.0 阶段五：整理体检。默认只出提案（dry_run），不碰任何正文。
@@ -1482,19 +1498,70 @@ async function organizeMemories({ dryRun = true, scope = '' } = {}) {
     for (const [name, slot] of acc) unit.set(name, l2normalize(slot.sum.map((x) => x / slot.n)));
     const links = readLinks();
     const list = [...unit.keys()].sort();
+    const dim = list.length ? unit.get(list[0]).length : 0;
+    // 去掉全局共模：真实 embedding 有一条共同方向（实测两两余弦均值 0.42），不去掉阈值就没意义
+    const meanVec = new Array(dim).fill(0);
+    for (const v of unit.values()) for (let d = 0; d < dim; d += 1) meanVec[d] += v[d] / unit.size;
+    const centered = new Map();
+    for (const [name, v] of unit) centered.set(name, l2normalize(v.map((x, d) => x - meanVec[d])));
+    const sims = [];
     for (let i = 0; i < list.length; i += 1) {
       for (let j = i + 1; j < list.length; j += 1) {
         const a = list[i];
         const b = list[j];
-        const va = unit.get(a);
-        const vb = unit.get(b);
+        const va = centered.get(a);
+        const vb = centered.get(b);
         let dot = 0;
-        for (let d = 0; d < va.length; d += 1) dot += va[d] * vb[d];
-        const cos = Number(dot.toFixed(3));
-        if (cos >= ORGANIZE_MERGE_COS) proposals.merge.push({ a, b, cos });
-        else if (cos >= ORGANIZE_LINK_COS && !(links[a] && links[a][b])) proposals.link.push({ a, b, cos });
+        for (let d = 0; d < dim; d += 1) dot += va[d] * vb[d];
+        sims.push({ a, b, cos: Number(dot.toFixed(4)) });
       }
     }
+    const cosList = sims.map((x) => x.cos);
+    const mu = cosList.length ? cosList.reduce((x, y) => x + y, 0) / cosList.length : 0;
+    const sd = cosList.length > 1
+      ? Math.sqrt(cosList.reduce((acc, x) => acc + (x - mu) ** 2, 0) / (cosList.length - 1))
+      : 0.05;
+    const u = pidState(entries.length).u;
+    const z = clampNum(MERGE_Z0 + MERGE_Z_GAIN * u, -1.2, 2.2);
+    const threshold = Number((mu + z * Math.max(sd, 0.02)).toFixed(4));
+    const linkLine = Number((mu + MERGE_LINK_Z * Math.max(sd, 0.02)).toFixed(4));
+    // 成束 = 阈值以上的连通分量（用户定的规则不变）
+    const parent = new Map(list.map((x) => [x, x]));
+    const find = (x) => {
+      let r = x;
+      while (parent.get(r) !== r) r = parent.get(r);
+      while (parent.get(x) !== r) { const nx = parent.get(x); parent.set(x, r); x = nx; }
+      return r;
+    };
+    for (const sim of sims) if (sim.cos >= threshold) {
+      const ra = find(sim.a);
+      const rb = find(sim.b);
+      if (ra !== rb) parent.set(ra, rb);
+    }
+    const bundles = new Map();
+    for (const name of list) {
+      const root = find(name);
+      if (!bundles.has(root)) bundles.set(root, []);
+      bundles.get(root).push(name);
+    }
+    // 束达到 M 条：只并「束内最像的一对」，每束一条提案 → 束大小被压在 M 以下（均匀）
+    for (const members of bundles.values()) {
+      if (members.length < MERGE_BUNDLE_SIZE) continue;
+      const inside = new Set(members);
+      let best = null;
+      for (const sim of sims) {
+        if (!inside.has(sim.a) || !inside.has(sim.b)) continue;
+        if (!best || sim.cos > best.cos) best = sim;
+      }
+      if (best) proposals.merge.push({ a: best.a, b: best.b, cos: best.cos, bundle: members.length });
+    }
+    for (const sim of sims) {
+      if (sim.cos >= threshold) continue;
+      if (sim.cos < linkLine) continue;
+      if (links[sim.a] && links[sim.a][sim.b]) continue;
+      proposals.link.push({ a: sim.a, b: sim.b, cos: sim.cos });
+    }
+    proposals.plan = { threshold, linkLine, mu: Number(mu.toFixed(4)), sd: Number(sd.toFixed(4)), z, bundleSize: MERGE_BUNDLE_SIZE, target: pidTarget() };
   } catch (err) {
     degraded = true;
     logPluginError('organize:index', err);
@@ -1515,9 +1582,11 @@ async function organizeMemories({ dryRun = true, scope = '' } = {}) {
     }
   }
 
+  const plan = proposals.plan || null;
   const lines = [
-    `体检 ${entries.length} 条${scopeText ? `（范围：${scopeText}）` : ''}${degraded ? '·语义路降级，只看了正文与关系边' : ''}`,
-    `· 合并 ${proposals.merge.length} 对：${proposals.merge.slice(0, 5).map((m) => `${m.a} × ${m.b}（${m.cos}）`).join('；') || '无'}`,
+    `体检 ${entries.length} 条 / 目标 ${plan ? plan.target : pidTarget()} 条${scopeText ? `（范围：${scopeText}）` : ''}${degraded ? '·语义路降级，只看了正文与关系边' : ''}`,
+    plan ? `· 束：阈值 ${plan.threshold}（μ${plan.mu >= 0 ? '+' : ''}${plan.mu}，${plan.sd}σ×${plan.z.toFixed(2)}），≥${plan.bundleSize} 条才并一对` : '',
+    `· 合并 ${proposals.merge.length} 对：${proposals.merge.slice(0, 5).map((m) => `${m.a} × ${m.b}（${m.cos}${m.bundle ? `，束 ${m.bundle} 条` : ''}）`).join('；') || '无'}`,
     `· 拆分 ${proposals.split.length} 条：${proposals.split.slice(0, 5).map((m) => `${m.name}（${m.chars} 字）`).join('；') || '无'}`,
     `· 删除 ${proposals.drop.length} 条：${proposals.drop.slice(0, 5).map((m) => `${m.name}（${m.ageTurns} 轮 · ${m.hits} 次回忆）`).join('；') || '无'}`,
     `· 补边 ${proposals.link.length} 条：${proposals.link.slice(0, 5).map((m) => `${m.a} → ${m.b}（${m.cos}）`).join('；') || '无'}`,
@@ -1875,7 +1944,7 @@ function promptInventory() {
   return {
     tier,
     total: entries.length,
-    target: MEM_TARGET,
+    target: pidTarget(),
     items: items.map((it) => ({ ...it, chars: Array.from(String(it.text || '')).length })),
     totalChars: items.reduce((n, it) => n + Array.from(String(it.text || '')).length, 0),
   };
@@ -2855,7 +2924,7 @@ function snapshot() {
         u: Number(pid.u.toFixed(3)),
         err: Number(pid.err.toFixed(3)),
         integral: Number(pid.integral.toFixed(3)),
-        target: MEM_TARGET,
+        target: pidTarget(),
         total: entries.length,
       };
     })(),
@@ -3845,7 +3914,7 @@ export function apply(ctx) {
             if (req.method !== 'POST') return sendJson(res, 405, { error: 'method' });
             try {
               const body = JSON.parse(await readBody(req));
-              const control = writeControl({ mode: body.mode, tier: body.tier });
+              const control = writeControl({ mode: body.mode, tier: body.tier, target: body.target });
               // 只取一次快照：snapshot() 要读索引、全量正文和几个 json，调两次既浪费也可能前后不一致。
               const snap = snapshot();
               sendJson(res, 200, { ...snap, control: { ...snap.control, ...control } });
@@ -4100,6 +4169,9 @@ export const __test = {
   organizeMemories,
   ORGANIZE_MERGE_COS,
   ORGANIZE_LINK_COS,
+  PID_FILE,
+  MERGE_BUNDLE_SIZE,
+  pidTarget,
   autoOrganize,
   ORGANIZE_FILE,
   shouldAutoRecall,
