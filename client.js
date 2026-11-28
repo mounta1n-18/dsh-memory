@@ -595,7 +595,21 @@ function ringProps(data) {
             },
             '提示词口径',
           ),
-          h(ModeSwitch, { value: manual ? 'manual' : 'auto', onChange: props.onMode }),
+          h(
+            'span',
+            {
+              style: {
+                fontSize: 10,
+                lineHeight: '14px',
+                padding: '0 5px',
+                borderRadius: 999,
+                whiteSpace: 'nowrap',
+                color: 'var(--dsw-alias-label-secondary)',
+                background: 'var(--dsw-alias-bg-layer-2)',
+              },
+            },
+            manual ? '手动' : '自动',
+          ),
         ),
         h(
           'span',
@@ -2550,6 +2564,12 @@ function ringProps(data) {
             ? h('button', { type: 'button', style: BUTTON, onClick: () => setQuery('') }, '清空')
             : null,
           // 排序分段控件：整块就是两个单元格，选中的那格换底色 + 加粗，比文字链接更容易一眼看出状态。
+          // 口径模式：自动（PID 推档）/ 手动（用户锁档）。放在工具栏里，别挤在仪表格子里。
+          h(ModeSwitch, {
+            value: (data?.control?.mode || 'auto') === 'manual' ? 'manual' : 'auto',
+            onChange: (mode) =>
+              setControl(mode, mode === 'manual' ? data?.control?.activeTier : undefined),
+          }),
           h(
             'div',
             {

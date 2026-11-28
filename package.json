@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-memory",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "private": true,
   "type": "module",
   "description": "记忆系统：设置页「记忆管理」+ 给模型一行中立状态",
