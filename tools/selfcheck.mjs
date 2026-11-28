@@ -1681,6 +1681,13 @@ console.log('\n[25] 2.0 自动召回（阶段四）');
   }));
   eq('检索抛错也不能影响对话', broken.messages.length, 1);
 
+  // 后台日志：为什么注入、为什么没注入，都要能事后查（面板与排障都靠它）
+  const recallLog = JSON.parse(fs.readFileSync(T.RECALL_LOG_FILE, 'utf8'));
+  const hitRow = recallLog.find((r) => r.reason === 'injected');
+  ok('注入也写日志', Boolean(hitRow), JSON.stringify(recallLog[0] || null));
+  ok('日志记了注入了哪几条', /pl-mem/.test(JSON.stringify((hitRow && hitRow.names) || [])));
+  ok('日志带耗时', Boolean(hitRow) && typeof hitRow.ms === 'number');
+
   T.resetRecall();
   T.setRecallImpl(async () => ({ results: [{ name: 'weak', summary: '弱命中', ranks: [null, 7], cos: 0.2 }] }));
   const weak = await T.autoRecallListener({}, async () => ({
@@ -1688,6 +1695,10 @@ console.log('\n[25] 2.0 自动召回（阶段四）');
     messages: [{ role: 'user', content: [{ type: 'text', text: '第四个问题' }] }],
   }));
   eq('弱命中不加消息', weak.messages.length, 1);
+  const weakLog = JSON.parse(fs.readFileSync(T.RECALL_LOG_FILE, 'utf8'));
+  ok('没注入也写日志，带原因', weakLog.some((r) => ['below-gate', 'below-gate-neighbours', 'no-results'].includes(r.reason)), weakLog[0].reason);
+
+
 
   const gate = async (results) => {
     T.resetRecall();

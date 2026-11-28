@@ -3006,6 +3006,8 @@ function snapshot() {
       lastTurns,
       sinceTurns,
       recallSince: recallTurnsSince(cycleStart),
+      // 最近一次自动召回的结局（为什么注入 / 为什么没注入），面板上直接显示。
+      last: Array.isArray(readJson(RECALL_LOG_FILE, null)) ? readJson(RECALL_LOG_FILE, [])[0] || null : null,
       stage: cst?.stage || '',
       reason: cst?.reason || '',
       files: Array.isArray(cst?.files) ? cst.files : [],
@@ -3146,7 +3148,9 @@ function revealFile(file) {
  * 为什么不用 systemPrompt.context 做这件事：那段是缓存前缀，每轮换内容等于每轮重新计费；
  * 召回结果必须落在「用户这条消息之后」，所以只能在 agent/pre-step 里往消息数组追加。
  */
-const RECALL_TIMEOUT_MS = 600;
+// 600ms 在冷启动时太紧：首次 embedding 要建 TLS、模型也要热，实测能到 700ms+，
+// 超时的后果是「这一轮静默没有记忆」。放宽到 1200ms，宁可慢半秒也别悄悄丢召回。
+const RECALL_TIMEOUT_MS = 1200;
 const RECALL_K = 3;
 const RECALL_MIN_COS = 0.5;
 const RECALL_MIN_BM25 = 8;
@@ -3227,12 +3231,26 @@ function recallBlock(results) {
   return `${RECALL_MARK}按你这句话自动检索了几条，可能是你要的：\n${lines.join('\n')}\n要正文用 memory_read（可一次传多个）；都不相关就忽略这一块。`;
 }
 
+const RECALL_LOG_FILE = path.join(TIDY, 'recall-log.json');
+const RECALL_LOG_MAX = 40;
+
+/** 记一次自动召回的结局：为什么注入、为什么没注入。面板与排障都靠它。 */
+function logRecall(entry) {
+  try {
+    const rows = Array.isArray(readJson(RECALL_LOG_FILE, null)) ? readJson(RECALL_LOG_FILE, []) : [];
+    rows.unshift({ at: new Date().toISOString(), turn: turnCount, ...entry });
+    writeJson(RECALL_LOG_FILE, rows.slice(0, RECALL_LOG_MAX));
+  } catch {
+    /* 诊断写不进去不影响对话 */
+  }
+}
+
 async function recallForPrompt(prompt) {
   const run = recallImpl || hybridSearch;
   const out = await run(prompt, { k: RECALL_K, mode: 'auto' });
   const results = (out && out.results) || [];
-  const none = { block: '', count: 0 };
-  if (!results.length) return none;
+  const none = (reason) => ({ block: '', count: 0, diag: { reason } });
+  if (!results.length) return none('no-results');
   // 门槛只看原始分数，不看 RRF 名次：RRF 总会给某人第一名，拿名次当强度等于没有门槛。
   // 实测（41 条真实索引）：相关提问 cos 0.56~0.67、无关提问 cos 0.26~0.31，取 0.5 有安全边际；
   // 语义路不可用（无 Key / 索引降级）时退回字面分 bm25 >= 8（相关 4.9~17.7，噪音 ≤7.2）。
@@ -3241,10 +3259,16 @@ async function recallForPrompt(prompt) {
   const bm25 = Number(top.bm25 || 0);
   const vectorUsed = cos > 0;
   const strong = vectorUsed ? cos >= RECALL_MIN_COS : bm25 >= RECALL_MIN_BM25;
-  if (!strong) return none;
+  if (!strong) {
+    return { block: '', count: 0, diag: { reason: 'below-gate', cos, bm25, vectorUsed, top: top.name } };
+  }
   const kept = results.filter((r) => (vectorUsed ? Number(r.cos || 0) >= RECALL_MIN_COS - 0.05 : Number(r.bm25 || 0) >= RECALL_MIN_BM25 / 2));
-  if (!kept.length) return none;
-  return { block: recallBlock(kept), count: kept.length };
+  if (!kept.length) return none('below-gate-neighbours');
+  return {
+    block: recallBlock(kept),
+    count: kept.length,
+    diag: { reason: 'injected', cos, bm25, vectorUsed, names: kept.map((r) => r.name) },
+  };
 }
 
 /** agent/pre-step：把召回块作为一条独立插件消息，插到最后一条用户消息之后。 */
@@ -3254,7 +3278,11 @@ async function autoRecallListener(_payload, next) {
   try {
     const turn = lastUserTurn(decision.messages);
     const prompt = turn.text;
-    if (turn.index < 0 || !shouldAutoRecall(prompt)) return decision;
+    if (turn.index < 0) return decision;
+    if (!shouldAutoRecall(prompt)) {
+      logRecall({ ms: 0, injected: 0, reason: 'skip-prompt', text: prompt.slice(0, 40) });
+      return decision;
+    }
     const key = hashText(prompt);
     if (key === lastRecallKey) return decision;
     const messages = decision.messages.slice();
@@ -3262,8 +3290,26 @@ async function autoRecallListener(_payload, next) {
     const next = messages[turn.index + 1];
     if (next && isPluginMessage(next) && next.source && next.source.kind === 'plugin:dsh-memory') return decision;
     lastRecallKey = key;
+    const t0 = Date.now();
     const found = await withTimeout(recallForPrompt(prompt), RECALL_TIMEOUT_MS);
-    if (!found || !found.block) return decision;
+    const ms = Date.now() - t0;
+    if (!found) {
+      logRecall({ ms, injected: 0, reason: 'timeout', text: prompt.slice(0, 40) });
+      return decision;
+    }
+    if (!found.block) {
+      logRecall({
+        ms,
+        injected: 0,
+        reason: found.diag?.reason || 'empty',
+        cos: found.diag?.cos,
+        bm25: found.diag?.bm25,
+        top: found.diag?.top,
+        text: prompt.slice(0, 40),
+      });
+      return decision;
+    }
+    logRecall({ ms, injected: found.count, reason: 'injected', cos: found.diag?.cos, names: found.diag?.names, text: prompt.slice(0, 40) });
     messages.splice(turn.index + 1, 0, recallMessage(found.block, found.count));
     return { ...decision, messages };
   } catch (err) {
@@ -4228,6 +4274,11 @@ export function apply(ctx) {
 
 /** 给 tools/selfcheck.mjs 用的纯函数出口：压缩预算、工具声明、回包解析。 */
 export const __test = {
+  logRecall,
+  recallForPrompt,
+  RECALL_LOG_FILE,
+  RECALL_TIMEOUT_MS,
+  promptInventory,
   compressMaxTokens,
   compressToolSpec,
   toolCallItems,
