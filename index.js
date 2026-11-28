@@ -389,7 +389,8 @@ const MEMORY_DIR_GREP_DENY_TEXT = '不要搜索记忆仓库目录；改用 memor
 
 function lessonEntries() {
   try {
-    return readEntries().filter((e) => e.enabled && /^教训\//.test(e.keywords || ''));
+    // 2.0 起分类在第 8 列；旧行仍从关键词首段认。
+    return readEntries().filter((e) => e.enabled && (e.category === '教训' || /^教训\//.test(e.keywords || '')));
   } catch {
     return [];
   }
@@ -423,13 +424,13 @@ function lessonHooksLine(max = 24, hint = '') {
   const alias = HINT_ALIASES.filter((r) => r.when.test(signal)).map((r) => r.segs);
   const scoreOf = (e) => {
     if (!signal) return 0;
-    const body = String(e.keywords || '').split('/').slice(1);
+    const body = String(e.summary || '').split('/');
     const literal = body.reduce(
       (n, seg) => (seg && signal.includes(String(seg).toLowerCase().replace(/\s+/g, '')) ? n + 1 : n),
       0,
     );
     // 语义命中只算一次加权，避免一条记忆因为多个别名段被重复抬高。
-    const semantic = alias.some((re) => re.test(String(e.keywords || ''))) ? 2 : 0;
+    const semantic = alias.some((re) => re.test(String(e.summary || ''))) ? 2 : 0;
     return literal + semantic;
   };
   const scored = list.map((e, i) => ({ e, i, score: scoreOf(e) }));
@@ -437,7 +438,7 @@ function lessonHooksLine(max = 24, hint = '') {
   return scored
     .slice(0, max)
     .map(({ e }) => {
-      const segs = String(e.keywords || '').split('/').slice(1).filter(Boolean).slice(0, 2);
+      const segs = String(e.summary || '').split('/').filter(Boolean).slice(0, 2);
       return `${e.file.replace(/\.md$/i, '')}=${segs.join('/') || '（无关键词）'}`;
     })
     .join(' · ');
@@ -494,6 +495,38 @@ function assertCategory(keywords, { allowManual = false } = {}) {
  * 关键词是「钩子」，不是「关键句」（2026-11-13 用户口径）：
  * 太长就从提醒变成负担，每段 ≤10 字、最多 4 段，写成词组，不能写成「……前看」这类句子。
  */
+/**
+ * 2.0 起索引第 2 列存的是一句话摘要（不是关键词串），第 8 列单独存分类。
+ * 上限 40 字：再长就会在大纲里被裁掉，写长了等于白写。
+ */
+const SUMMARY_MAX = 40;
+
+function assertSummary(summary) {
+  const text = oneLine(summary, 120);
+  if (!text) throw new Error('summary 不能为空：一句话说清「什么时候该点开这条」');
+  const chars = Array.from(text).length;
+  if (chars > SUMMARY_MAX) {
+    throw new Error(
+      `summary 有 ${chars} 字，超过 ${SUMMARY_MAX} 字上限：它是一句话摘要，不是正文；细节写进 body。`,
+    );
+  }
+  if (/^(资料|教训|说明书|项目记忆|其它)[\/·]/.test(text)) {
+    throw new Error('summary 里不用再写分类前缀：分类放在 category 字段（资料 / 教训 / 说明书 / 其它）');
+  }
+  return text;
+}
+
+/** 旧关键词串 → { category, summary }，给 createMemory / 设置页这些还按旧格式传参的调用点用。 */
+function keywordParts(keywords) {
+  const parts = String(keywords || '')
+    .split('/')
+    .map((x) => x.trim())
+    .filter(Boolean);
+  const head = parts[0] || '';
+  if (CATEGORIES.includes(head)) return { category: head, summary: parts.slice(1).join('/') || head };
+  return { category: '', summary: parts.join('·') };
+}
+
 const KEYWORD_SEG_MAX = 10;
 const KEYWORD_SEG_COUNT = 4;
 
@@ -824,7 +857,10 @@ function oneLine(value, max = 160) {
 }
 
 /** 在索引表最后一条数据行后面追加一行。 */
-function addIndexRow({ file, keywords, type, hint }) {
+function addIndexRow({ file, keywords, type, hint, summary, category }) {
+  const parts = keywordParts(keywords);
+  const shownSummary = summary || parts.summary;
+  const shownCategory = category || parts.category;
   const p = path.join(MEM, 'MEMORY.md');
   const text = fs.readFileSync(p, 'utf8');
   const eol = text.includes('\r\n') ? '\r\n' : '\n';
@@ -837,7 +873,11 @@ function addIndexRow({ file, keywords, type, hint }) {
     if (name.endsWith('.md')) last = i;
   }
   if (last < 0) throw new Error('索引表里找不到可追加的位置');
-  lines.splice(last + 1, 0, `| \`${file}\` | ${keywords} | 是 | ${type} | ${hint} | ${today()} | 否 |`);
+  lines.splice(
+    last + 1,
+    0,
+    `| \`${file}\` | ${shownSummary} | 是 | ${type} | ${hint} | ${today()} | 否 | ${shownCategory} |`,
+  );
   fs.writeFileSync(p, lines.join(eol), 'utf8');
 }
 
@@ -1229,11 +1269,26 @@ function createMemory(input) {
     throw new Error(`记忆 ${file} 已经存在；要改内容请用 memory_update`);
   }
   const keywords = oneLine(input?.keywords, 80);
+  const summaryIn = oneLine(input?.summary, 120);
+  const categoryIn = oneLine(input?.category, 20);
   const description = oneLine(input?.description);
   const type = oneLine(input?.type, 24) || 'reference';
   const body = String(input?.body || '').trim();
-  if (!keywords) throw new Error('关键词不能为空，否则大纲里点不到它');
-  assertCategory(keywords, { allowManual: true });
+  let summary = '';
+  let category = '';
+  if (summaryIn || categoryIn) {
+    summary = assertSummary(summaryIn);
+    category = categoryIn;
+    if (category !== MANUAL_CATEGORY && !CATEGORIES.includes(category)) {
+      throw new Error(`category 只能是：资料 / 教训 / 说明书 / 项目记忆 / 其它`);
+    }
+  } else {
+    if (!keywords) throw new Error('summary 或 keywords 至少给一个，否则大纲里点不到它');
+    assertCategory(keywords, { allowManual: true });
+    const parts = keywordParts(keywords);
+    summary = parts.summary;
+    category = parts.category;
+  }
   if (!description) throw new Error('描述不能为空，一句话说清什么时候读');
   if (!body) throw new Error('正文不能为空');
   assertBodyLength(body);
@@ -1256,7 +1311,7 @@ function createMemory(input) {
     'utf8',
   );
   try {
-    addIndexRow({ file, keywords, type, hint: description });
+    addIndexRow({ file, keywords, type, hint: description, summary, category });
   } catch (err) {
     try {
       fs.unlinkSync(target);
@@ -1795,10 +1850,19 @@ const WRITE_TOOL_PARAMETERS = {
   type: 'object',
   properties: {
     name: { type: 'string', description: '记忆名称，英文小写和连字符，如 gift-ideas。' },
+    summary: {
+      type: 'string',
+      description:
+        '一句话摘要（≤40 字），写「什么场景下必须点开这条」，要具体：教训写会闯祸的场面（批量删家目录前先看清路径），资料写认得出来的场景（写邮件前看称呼），说明书写卡住时你正想干什么（读写记忆必读、MCP 连不上先看懒加载）。别写「……前看」这种尾巴，别写空泛词（插件/记忆/工具）。',
+    },
+    category: {
+      type: 'string',
+      description: '分类，只能是 资料 / 教训 / 说明书 / 其它（项目记忆 只能由用户点「大脑」按钮生成）。',
+    },
     keywords: {
       type: 'string',
       description:
-        '钩子不是句子：每段 ≤10 字，1~4 段用 / 分隔，首段是分类。教训写场景（`教训/删家目录`、`教训/装完即验收`），资料写认得出来的对象（`资料/称呼/基本信息`），说明书写工具名（`说明书/MCP/懒加载`）。别写「……前看」尾巴，别写空泛词（插件/记忆/工具）。',
+        '旧口径（可选，2.0 起建议改用 summary + category）：每段 ≤10 字、1~4 段用 / 分隔，首段是分类。',
     },
     description: { type: 'string', description: '一句话说清这是什么、什么时候该读。' },
     body: { type: 'string', description: '正文，Markdown，写完整句子；2000 字以内通常够用，内容确实需要可以更长。' },
@@ -1811,7 +1875,7 @@ const WRITE_TOOL_PARAMETERS = {
         '提到名字就必须真读过（memory_read 才算），插件会核对。相似 → 改原文；相关 → memory_update + append:true；相同 → 别建。',
     },
   },
-  required: ['name', 'keywords', 'description', 'body'],
+  required: ['name', 'description', 'body'],
   additionalProperties: false,
 };
 
@@ -2707,9 +2771,19 @@ function readEntries() {
     if (cells.length < 2) continue;
     const name = cells[0].replace(/`/g, '').trim();
     if (!name.endsWith('.md') || name === 'MEMORY.md') continue;
+    const rawKeywords = normalizeKeywords((cells[1] || '').replace(/`/g, ''));
+    const kwHead = rawKeywords.split('/')[0].trim();
+    const catCell = (cells[7] || '').replace(/`/g, '').trim();
+    const legacyCategory = CATEGORIES.includes(kwHead) ? kwHead : '';
+    // 2.0 起第 2 列是一句话摘要、第 8 列是分类；旧行仍能从关键词首段认出分类。
+    const category = CATEGORIES.includes(catCell) ? catCell : legacyCategory;
+    const summary = legacyCategory ? rawKeywords.split('/').slice(1).join('/') : rawKeywords;
     rows.push({
       file: name,
-      keywords: normalizeKeywords((cells[1] || '').replace(/`/g, '')),
+      keywords: rawKeywords,
+      summary,
+      category,
+      aliases: legacyCategory ? rawKeywords.split('/').slice(1).filter(Boolean) : [],
       enabled: !/^否$/.test((cells[2] || '').trim()),
       type: (cells[3] || '').trim(),
       whenToRead: (cells[4] || '').trim(),
@@ -2763,45 +2837,37 @@ const OUTLINE_HOT_HITS = 2;
 const OUTLINE_COLD_KW_MAX = 16;
 
 function outlineText(entries = readEntries()) {
-  const live = entries.filter((e) => e.enabled && e.keywords);
+  const live = entries.filter((e) => e.enabled && (e.summary || e.keywords));
   if (!live.length) return '';
-  const headOf = (kw) => {
-    const head = String(kw).split('/')[0].trim();
-    return CATEGORIES.includes(head) ? head : '未分类';
-  };
   const hits = recallRates();
   // 观察窗口不足 20 轮时不做冷热区分：新装或刚清理时没有统计，全削短既没依据也会伤召回。
   const windowSize = Math.min(WINDOW_TURNS, turnCount);
   const coldStart = windowSize < 20;
   const isHot = (e) => coldStart || e.protected || (hits.get(e.file) || 0) >= OUTLINE_HOT_HITS;
   const lines = [
-    '记忆索引（名称=关键词）。关键词是钩子，写的是「什么场景下必须点开这条」。读正文用 memory_read，可一次传多个（file:"a、b"）。',
+    '记忆索引（名称=摘要）。摘要写的是「什么场景下必须点开这条」。读正文用 memory_read，可一次传多个（file:"a、b"）。',
     '动手改 / 删 / 装 / 跑命令之前，先扫【教训】；要用某个工具 / 插件 / 技能之前，先看它的【说明书】；提到旧事或接手旧任务，扫对应分组；拿不准就查——查错一次调用，漏查要返工。',
     // 总量口径：六套措辞由 PID 选出，模型只看到一句话，看不到机制。
     TIER_LINES[currentTier(entries.length) - 1],
   ];
   for (const [cat] of OUTLINE_GROUPS) {
     const rows = live
-      .filter((e) => headOf(e.keywords) === cat)
+      .filter((e) => (e.category || '未分类') === cat)
       .map((e) => {
-        const raw = String(e.keywords);
-        const head = raw.split('/')[0].trim();
-        const body = CATEGORIES.includes(head) ? raw.replace(/^[^/]+\//, '') : raw;
-        // 组名已经写明了分类，关键词里省掉前缀；裁剪预算按「去前缀后的可用长度」算。
-        // 冷条只留前几段：名字仍在大纲里，用到时再读正文。
-        // 但至少放得下第一段——宁可多几个字，也不把「huashu-motion-install」切成半截。
-        const prefix = CATEGORIES.includes(head) ? head.length + 1 : 0;
+        const body = String(e.summary || '');
+        // 组名已经写明了分类，摘要里不再重复分类前缀，裁剪预算按整段算。
+        // 冷条只留前半句：名字仍在大纲里，用到时再读正文。
         const firstLen = Array.from(body.split('/')[0] || '').length;
         const budget = isHot(e)
-          ? Math.max(10, OUTLINE_KW_MAX - prefix)
-          : Math.max(10, Math.min(OUTLINE_KW_MAX - prefix, Math.max(OUTLINE_COLD_KW_MAX - prefix, firstLen)));
+          ? Math.max(10, OUTLINE_KW_MAX)
+          : Math.max(10, Math.min(OUTLINE_KW_MAX, Math.max(OUTLINE_COLD_KW_MAX, firstLen)));
         return `${e.file.replace(/\.md$/, '')}=${clipKeywords(body, budget)}`;
       });
     if (rows.length) lines.push(`【${cat}】${rows.join(' · ')}`);
   }
-  // 有教训就有前置检查：教训的钩子写的是「会闯祸的场面」，读者必须在动手前对一遍。
-  if (live.some((e) => /^教训\//.test(e.keywords))) {
-    lines.push('【教训】的钩子写的是「会闯祸的场面」：命中就先 memory_read 读完，再动手。');
+  // 有教训就有前置检查：教训的摘要写的是「会闯祸的场面」，读者必须在动手前对一遍。
+  if (live.some((e) => e.category === '教训')) {
+    lines.push('【教训】的摘要写的是「会闯祸的场面」：命中就先 memory_read 读完，再动手。');
   }
   return lines.join('\n');
 }
@@ -3545,18 +3611,37 @@ export function apply(ctx) {
               throw new Error(`记忆 ${file} 已经存在；要改内容请用 memory_update`);
             }
             const keywords = oneLine(args?.keywords, 80);
+            const summaryIn = oneLine(args?.summary, 120);
+            const categoryIn = oneLine(args?.category, 20);
             const description = oneLine(args?.description);
             const type = oneLine(args?.type, 24) || 'reference';
             const body = String(args?.body || '').trim();
-            if (!keywords) throw new Error('keywords 不能为空，否则大纲里点不到它');
-            // 「项目记忆」只由 /remember 或设置页新建产生，模型通道一律拒绝。
-            assertCategory(keywords);
-            const lengthProblem = keywordTooLong(keywords);
-            if (lengthProblem) throw new Error(lengthProblem);
-            const kwProblem = lessonKeywordProblem(keywords);
-            if (kwProblem) throw new Error(kwProblem);
-            const vagueProblem = keywordTooVague(keywords);
-            if (vagueProblem) throw new Error(vagueProblem);
+            let summary = '';
+            let category = '';
+            if (summaryIn || categoryIn) {
+              // 2.0 口径：一句话摘要 + 单独的分类字段。
+              summary = assertSummary(summaryIn);
+              category = categoryIn;
+              if (category === MANUAL_CATEGORY) {
+                throw new Error(`${MANUAL_CATEGORY} 只能由用户点「大脑」按钮生成；请改用 资料 / 教训 / 说明书 / 其它`);
+              }
+              if (!CATEGORIES.includes(category)) {
+                throw new Error(`category 只能是：资料 / 教训 / 说明书 / 其它（${MANUAL_CATEGORY} 仅手动）`);
+              }
+            } else {
+              // 旧口径：关键词串，首段是分类。写进索引时拆成摘要 + 分类两列。
+              if (!keywords) throw new Error('summary 或 keywords 至少给一个，否则大纲里点不到它');
+              assertCategory(keywords);
+              const lengthProblem = keywordTooLong(keywords);
+              if (lengthProblem) throw new Error(lengthProblem);
+              const kwProblem = lessonKeywordProblem(keywords);
+              if (kwProblem) throw new Error(kwProblem);
+              const vagueProblem = keywordTooVague(keywords);
+              if (vagueProblem) throw new Error(vagueProblem);
+              const parts = keywordParts(keywords);
+              summary = parts.summary;
+              category = parts.category;
+            }
             if (!description) throw new Error('description 不能为空，一句话说清什么时候读');
             if (!body) throw new Error('body 不能为空');
             assertBodyLength(body);
@@ -3566,7 +3651,7 @@ export function apply(ctx) {
             const target = path.join(MEM, file);
             fs.writeFileSync(target, joinDoc(attrs, body), 'utf8');
             try {
-              addIndexRow({ file, keywords, type, hint: description });
+              addIndexRow({ file, keywords, type, hint: description, summary, category });
             } catch (err) {
               // 索引补不上就把文件撤回：否则留下孤儿文件，下次同名写入会被挡住
               try {
@@ -3582,7 +3667,7 @@ export function apply(ctx) {
             }
             return {
               text:
-                `已记下：${file}\n关键词：${keywords}${lengthNote(file, body)}` +
+                `已记下：${file}\n摘要：${summary}（${category}）${lengthNote(file, body)}` +
                 (dupe.named.length
                   ? `\n（查重结论：${dupe.line}）`
                   : ''),

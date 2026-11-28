@@ -286,16 +286,11 @@ ok('教训排最前（动手前先对场景）', names[0] === 'noahs-ark', names
 const longSeg = outline.split(' · ').find((s) => s.startsWith('huashu-motion-install='));
 ok('40 字关键词整段保留', !longSeg.includes('…'), longSeg);
 const plMem = outline.split(' · ').find((s) => s.startsWith('pl-mem='));
-ok('44 字关键词在 / 边界裁剪并加 …', /…$/.test(plMem), plMem);
 ok(
-  '裁剪后不切半截（每段都是完整关键词）',
-  plMem
-    .slice('pl-mem='.length)
-    .replace(/…$/, '')
-    .split('/')
-    .every((p) => ['说明书', '记忆', '索引', 'dsh-memory', '大纲', '整理', '压缩', '回忆率', '待删除', '审批'].includes(p)),
+  '摘要整句进大纲，不切半截',
+  !plMem.includes('…') && Array.from(plMem.slice('pl-mem='.length)).length <= 45,
+  plMem,
 );
-ok('裁剪后长度不超过上限+省略号', Array.from(plMem.slice('pl-mem='.length)).length <= 43, `${Array.from(plMem.slice('pl-mem='.length)).length} 字`);
 
 // 有「教训/」条目时，大纲必须自带「什么场景该点开」+ 末尾前置检查：
 // 召回率不靠模型自觉，靠索引里写清场景钩子。
@@ -399,10 +394,15 @@ ok(
   /别写错误码和根因/.test(write.description) && /教训\/422|422、报错/.test(write.description),
 );
 ok(
-  'keywords 参数描述也是短钩子口径',
-  /钩子不是句子/.test(write.parameters.properties.keywords.description) &&
-    /每段 ≤10 字/.test(write.parameters.properties.keywords.description),
-  write.parameters.properties.keywords.description,
+  'summary 参数写明它是「什么场景下必须点开」的一句话',
+  /≤40 字/.test(write.parameters.properties.summary.description) &&
+    /什么场景下必须点开/.test(write.parameters.properties.summary.description),
+  write.parameters.properties.summary.description,
+);
+ok(
+  'category 参数只认四个分类',
+  /资料 \/ 教训 \/ 说明书 \/ 其它/.test(write.parameters.properties.category.description),
+  write.parameters.properties.category.description,
 );
 ok('教训正文要求写场景/链条/修复三段', /错误链条/.test(write.description) && /绕开与修复/.test(write.description));
 const mk = (keywords) => ({
@@ -943,7 +943,7 @@ ok('不再要求 response_format=json_object', askedBody.response_format === und
 ok('文件已落盘', fs.existsSync(path.join(MEM, 'dsh-memory.md')));
 const remembered = fs.readFileSync(path.join(MEM, 'dsh-memory.md'), 'utf8');
 ok('正文分条列写', /工作剖面/.test(remembered) && /风险/.test(remembered));
-ok('索引行首关键词是项目记忆', /\| `dsh-memory\.md` \| 项目记忆\//.test(fs.readFileSync(path.join(MEM, 'MEMORY.md'), 'utf8')));
+ok('索引行的分类列是项目记忆', /\| `dsh-memory\.md` \|.*\| 项目记忆 \|/.test(fs.readFileSync(path.join(MEM, 'MEMORY.md'), 'utf8')));
 // 撞名：同一项目再记一次 → 加序号，不覆盖
 r = await call(state, '/dsh-memory/remember', { sessionId: 'sess-1' });
 ok('撞名自动加序号', r.code === 200 && fs.existsSync(path.join(MEM, 'dsh-memory-2.md')), JSON.stringify(r.body));
@@ -965,7 +965,7 @@ globalThis.fetch = async () => {
   return { ok: true, status: 200, async text() { return JSON.stringify({ choices: [{ message: { content: '', tool_calls } }] }); } };
 };
 r = await call(state, '/dsh-memory/remember', { sessionId: 'sess-1' });
-ok('首关键词被强制成项目记忆', /\| `wild\.md` \| 项目记忆\//.test(fs.readFileSync(path.join(MEM, 'MEMORY.md'), 'utf8')));
+ok('分类被强制成项目记忆', /\| `wild\.md` \|.*\| 项目记忆 \|/.test(fs.readFileSync(path.join(MEM, 'MEMORY.md'), 'utf8')));
 
 // 主 agent 自己写：走 DSH 的 llm 服务 + memory_write 工具声明，不写会话、不发 HTTP
 let httpCalls = 0;
@@ -1777,6 +1777,68 @@ console.log('\n[28] 束稳态：目标可配 + 阈值随 PID 走');
   const lo = await thresholdAt(-0.8);
   ok('PID 的 u 越大，合并阈值越高（条目少 → 少合并）', hi !== null && lo !== null && hi > lo, `${hi} vs ${lo}`);
   eq('体检摘要里写明目标条数', /目标 \d+ 条/.test((await T.organizeMemories({ dryRun: true })).text), true);
+}
+
+console.log('\n[29] 2.0 摘要口径：一句话 summary + 独立 category');
+{
+  const body = '自检正文：这条只用来验证摘要口径。';
+  const dup = '只比了关键词，判为无关，新建';
+
+  const w1 = write.execute({
+    name: 'tmp-summary',
+    summary: '要改插件前端前先看这条',
+    category: '资料',
+    description: '自检用摘要条目',
+    body,
+    dup_check: dup,
+  });
+  ok('用 summary + category 能写入', /已记下/.test(String(w1?.text || '')), String(w1?.text || '').slice(0, 40));
+
+  const idx = fs.readFileSync(path.join(MEM, 'MEMORY.md'), 'utf8');
+  const row = idx.split(/\r?\n/).find((l) => l.includes('tmp-summary.md')) || '';
+  ok('索引第 2 列存的是摘要', /\| `tmp-summary\.md` \| 要改插件前端前先看这条 \|/.test(row), row);
+  ok('索引最后一列是分类', /\| 资料 \|\s*$/.test(row), row);
+
+  const outline = T.outlineText();
+  ok('大纲里带摘要、不再带分类前缀', /tmp-summary=要改插件前端前先看这条/.test(outline), outline.split('\n').find((l) => l.includes('tmp-summary')) || '');
+  ok('大纲把它放进【资料】组', /【资料】[^\n]*tmp-summary=/.test(outline));
+
+  let longErr = '';
+  try {
+    write.execute({ name: 'tmp-sum-long', summary: '甲'.repeat(41), category: '资料', description: '自检', body, dup_check: dup });
+  } catch (err) {
+    longErr = err.message;
+  }
+  ok('摘要超过 40 字被拒', /超过 40 字/.test(longErr), longErr);
+
+  let catErr = '';
+  try {
+    write.execute({ name: 'tmp-cat-bad', summary: '分类写错也要拦住', category: '杂项', description: '自检', body, dup_check: dup });
+  } catch (err) {
+    catErr = err.message;
+  }
+  ok('非法分类被拒', /category 只能是/.test(catErr), catErr);
+
+  let manualErr = '';
+  try {
+    write.execute({ name: 'tmp-cat-manual', summary: '模型不许自己写项目记忆', category: '项目记忆', description: '自检', body, dup_check: dup });
+  } catch (err) {
+    manualErr = err.message;
+  }
+  ok('模型通道不许写项目记忆', /只能由用户点/.test(manualErr), manualErr);
+
+  // 旧口径仍能写：keywords 首段当分类，其余当摘要。
+  write.execute({ name: 'tmp-legacy', keywords: '教训/删目录/清缓存', description: '自检旧口径', body, dup_check: dup });
+  const row2 = fs.readFileSync(path.join(MEM, 'MEMORY.md'), 'utf8').split(/\r?\n/).find((l) => l.includes('tmp-legacy.md')) || '';
+  ok('旧 keywords 写法仍可用，且分类落到最后一列', /\| 教训 \|\s*$/.test(row2), row2);
+
+  for (const f of ['tmp-summary.md', 'tmp-legacy.md']) {
+    try {
+      fs.unlinkSync(path.join(MEM, f));
+    } catch {
+      /* 清不掉也不影响后续断言 */
+    }
+  }
 }
 
 if (process.env.DUMP_PROMPTS) {
