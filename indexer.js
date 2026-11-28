@@ -89,8 +89,10 @@ export function buildSegments(entry) {
   const fits = bodyChars(whole) <= MEMORY_BODY_MAX;
   const base = { name, file, keywords: summary, category, summary };
 
+  // 摘要也参与嵌入文本（见 segmentEmbedText），所以哈希必须带上它：
+  // 只改摘要也要重算向量，否则索引里的向量和实际喂给模型的文本对不上。
   if (fits && Array.from(whole).length >= SEGMENT_RULES.minChars) {
-    const hash = hashText(whole);
+    const hash = hashText(`${summary}\n${whole}`);
     return [makeSegment({ ...base, ordinal: 1, heading: '', text: whole, hash })];
   }
 
@@ -106,7 +108,7 @@ export function buildSegments(entry) {
           ordinal,
           heading: section.heading,
           text: piece,
-          hash: hashText(`${section.heading}\n${piece}`),
+          hash: hashText(`${summary}\n${section.heading}\n${piece}`),
           split: true,
         }),
       );

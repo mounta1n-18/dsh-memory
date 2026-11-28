@@ -479,9 +479,14 @@ try {
   threw = err.message;
 }
 ok('关键词段数超 4 被拒', /最多 4 段/.test(threw), threw);
-r = await call(state, '/dsh-memory/keyword', { file: 'pl-mcd.md', keywords: '说明书/点麦当劳前先看看有没有券' });
-eq('设置页改关键词同样拦长句', r.code, 400);
-ok('拦住时给出改写提示', /写成句子了/.test(r.body?.error || ''), r.body?.error);
+r = await call(state, '/dsh-memory/keyword', { file: 'pl-mcd.md', summary: '点'.repeat(45) });
+eq('设置页改摘要同样拦过长', r.code, 400);
+ok('拦住时说的是 40 字上限', /40 字上限/.test(r.body?.error || ''), r.body?.error);
+r = await call(state, '/dsh-memory/keyword', { file: 'pl-mcd.md', summary: '说明书/点麦当劳之前先看看有没有券' });
+eq('摘要口径改名成功', r.code, 200);
+const mcdRow = (r.body?.entries || []).find((e) => e.file === 'pl-mcd.md') || {};
+eq('旧写法里的分类被拆到分类列', mcdRow.category, '说明书');
+eq('第 2 列只剩摘要本身', mcdRow.summary, '点麦当劳之前先看看有没有券');
 
 // 正文长度：2000 字以内静默，超过只提一句（用户口径 2026-10-28：别用「警告」把人吓短）
 const shortBody = write.execute({ name: 'len-short', keywords: '其它/短正文静默', description: '自检', body: '甲'.repeat(600), dup_check: '只比了关键词，判为无关，新建' });
@@ -592,7 +597,8 @@ await runPost('memory_read', { file: 'pl-btw' }, 'sess-b');
 const callsA = await call(state, '/dsh-memory/calls?sessionId=sess-a');
 eq('只回本会话的调用', callsA.body.calls.length, 2);
 ok('时间正序：老记录在前、新记录在后', callsA.body.calls[0].op === 'read' && callsA.body.calls[1].op === 'write', JSON.stringify(callsA.body.calls.map((c) => c.op)));
-ok('读的记录带关键词', /说明书/.test((callsA.body.calls.find((c) => c.op === 'read') || {}).keywords || ''));
+const readRow = callsA.body.calls.find((c) => c.op === 'read') || {};
+ok('读的记录带摘要', /麦当劳|说明书|记忆插件/.test(String(readRow.keywords || readRow.summary || '')), JSON.stringify({ keywords: readRow.keywords, summary: readRow.summary }));
 eq('写的记录带字数', (callsA.body.calls.find((c) => c.op === 'write') || {}).chars, 5);
 ok('列表不回正文（省流量）', callsA.body.calls.every((c) => c.content === undefined), JSON.stringify(Object.keys(callsA.body.calls[0] || {})));
 const writeRow = callsA.body.calls.find((c) => c.op === 'write');

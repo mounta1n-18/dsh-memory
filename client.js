@@ -1345,7 +1345,7 @@ function ringProps(data) {
               field('时间', when),
               field('字数', data.chars ? `${data.chars} 字` : ''),
               field('类型', data.cat ? `${data.cat}${data.type ? ` · ${data.type}` : ''}` : data.type),
-              field('关键词', data.keywords),
+              field('摘要', data.summary || data.keywords),
               field('会话', data.sessionId ? String(data.sessionId).slice(0, 8) : ''),
               canLocate
                 ? h(
@@ -1877,7 +1877,7 @@ function ringProps(data) {
         setData(next);
         setError(false);
         const d = {};
-        for (const e of next.entries || []) d[e.file] = e.keywords;
+        for (const e of next.entries || []) d[e.file] = e.summary || e.keywords || '';
         setDraft(d);
       };
 
@@ -1998,7 +1998,7 @@ function ringProps(data) {
       };
 
       const saveKeywords = async (file) => {        try {
-          await post('/dsh-memory/keyword', { file, keywords: draft[file] ?? '' });
+          await post('/dsh-memory/keyword', { file, summary: draft[file] ?? '' });
           setEditing(null);
           flash(file, '已保存');
         } catch (err) {
@@ -2054,11 +2054,11 @@ function ringProps(data) {
 
       // 新建：分类拼成首关键词，其余关键词接在后面。
       const submitCreate = async () => {
-        const keywords = [form.category, form.extra.trim()].filter(Boolean).join('/');
         try {
           const body = await post('/dsh-memory/create', {
             name: form.name.trim(),
-            keywords,
+            summary: form.extra.trim(),
+            category: form.category,
             description: form.description.trim(),
             body: form.body,
           });
@@ -2134,14 +2134,16 @@ function ringProps(data) {
               updatedOf(b) - updatedOf(a) ||
               String(a.file).localeCompare(String(b.file));
       const visible = entries.filter((e) => !matched || matched.has(e.file)).slice().sort(sorter);
-      const categoryOf = (keywords) => {
-        const head = String(keywords || '').split('/')[0].trim();
+      const categoryOf = (entry) => {
+        const own = String(entry?.category || '').trim();
+        if (CATEGORIES.includes(own)) return own;
+        const head = String(entry?.keywords || '').split('/')[0].trim();
         return CATEGORIES.includes(head) ? head : '未分类';
       };
       const groups = [];
       // 展示顺序与分类优先级无关：「说明书」放最后，方便把它当资料库翻。
       for (const cat of ['资料', '教训', '项目记忆', '其它', '说明书', '未分类']) {
-        const list = visible.filter((e) => categoryOf(e.keywords) === cat);
+        const list = visible.filter((e) => categoryOf(e) === cat);
         if (list.length) groups.push({ cat, list });
       }
 
@@ -2166,7 +2168,7 @@ function ringProps(data) {
             onDoubleClick: () => {
               if (!entry.protected) setEditing(entry.file);
             },
-            title: entry.protected ? '已锁定：不压缩、不改原文和关键词' : '双击修改关键词',
+            title: entry.protected ? '已锁定：不压缩、不改原文和摘要' : '双击修改摘要',
           },
           h(
             'div',
@@ -2182,13 +2184,13 @@ function ringProps(data) {
                   onKeyDown: (ev) => {
                     if (ev.key === 'Enter') saveKeywords(entry.file);
                     if (ev.key === 'Escape') {
-                      setDraft((prev) => ({ ...prev, [entry.file]: entry.keywords }));
+                      setDraft((prev) => ({ ...prev, [entry.file]: entry.summary || entry.keywords || '' }));
                       setEditing(null);
                     }
                   },
                   spellCheck: false,
                   style: { ...INPUT, fontSize: 15, fontWeight: 600 },
-                  'aria-label': '记忆关键词',
+                  'aria-label': '记忆摘要',
                 })
               : h(
                   'span',
@@ -2200,7 +2202,7 @@ function ringProps(data) {
                       color: entry.enabled ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)',
                     },
                   },
-                  highlight(entry.keywords, search && search.q) || '（无关键词）',
+                  highlight(entry.summary || entry.keywords || '', search && search.q) || '（无摘要）',
                 ),
             h(
               'span',
@@ -2534,7 +2536,7 @@ function ringProps(data) {
           ),
           h('input', {
             value: query,
-            placeholder: '搜索关键词或正文…',
+            placeholder: '搜索摘要或正文…',
             onChange: (ev) => setQuery(ev.target.value),
             spellCheck: false,
             style: { ...INPUT, flex: '0 1 220px', width: 220 },
@@ -2702,10 +2704,10 @@ function ringProps(data) {
                   value: form.category,
                   onChange: (c) => setForm((f) => ({ ...f, category: c })),
                 }),
-                h('span', { style: { ...FORM_LABEL, width: 'auto' } }, '其余关键词'),
+                h('span', { style: { ...FORM_LABEL, width: 'auto' } }, '摘要'),
                 h('input', {
                   value: form.extra,
-                  placeholder: '用 / 分隔，如 项目名/工具名',
+                  placeholder: '一句话：什么场景下必须点开这条（≤40 字）',
                   onChange: (ev) => setForm((f) => ({ ...f, extra: ev.target.value })),
                   spellCheck: false,
                   style: { ...INPUT, maxWidth: 360 },

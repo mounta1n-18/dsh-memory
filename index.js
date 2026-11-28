@@ -3087,13 +3087,17 @@ function readBody(req, limit = 65536) {
 }
 
 /** 只改索引表里那一行的关键词单元格，保留其余文本与换行风格。 */
-function setKeywords(file, keywords) {
+function setKeywords(file, summary) {
   const entry = readEntries().find((e) => e.file === file);
-  if (entry?.protected) throw new Error('这份记忆已锁定，不能修改关键词');
-  const clean = normalizeKeywords(String(keywords).replace(/[|\r\n]/g, ' ').replace(/\s+/g, ' ').trim());
-  const lengthProblem = keywordTooLong(clean);
-  if (lengthProblem) throw new Error(lengthProblem);
-  return updateCell(file, 2, clean.slice(0, 80));
+  if (entry?.protected) throw new Error('这份记忆已锁定，不能修改摘要');
+  // 2.0 起第 2 列是一句话摘要（≤40 字），不再是一串 / 分隔的钩子；
+  // 旧写法仍然收：带分类前缀的会先拆出分类，再当摘要存。
+  const raw = String(summary).replace(/[|\r\n]/g, ' ').replace(/\s+/g, ' ').trim();
+  const parts = keywordParts(raw);
+  const clean = assertSummary(parts.summary || raw);
+  // 分类一律落到第 8 列：旧行可能靠「关键词首段」冒充分类，改写摘要后那个来源就没了。
+  if (parts.category) updateCell(file, 8, parts.category);
+  return updateCell(file, 2, clean);
 }
 
 /** 改「启用」单元格：开=是，关=否。只控制是否披露，不算改原文或关键词。 */
@@ -3899,7 +3903,7 @@ export function apply(ctx) {
             if (req.method !== 'POST') return sendJson(res, 405, { error: 'method' });
             try {
               const body = JSON.parse(await readBody(req));
-              const saved = setKeywords(String(body.file || ''), String(body.keywords || ''));
+              const saved = setKeywords(String(body.file || ''), String(body.summary ?? body.keywords ?? ''));
               sendJson(res, 200, { ...snapshot(), saved });
             } catch (err) {
               sendJson(res, 400, { error: err.message });
