@@ -1667,7 +1667,16 @@ async function hybridSearch(rawQuery, opts = {}) {
   if (!idx.segments.length) {
     throw new Error(`索引还是空的${degraded ? `（${reason}）` : ''}：先用面板「重建索引」或跑 node tools/reindex.mjs`);
   }
-  const segs = idx.segments;
+  // 停用的条目不该被检索到（它连大纲都不进），否则停用等于没停用。
+  const off = new Set(
+    readEntries()
+      .filter((e) => !e.enabled)
+      .map((e) => stemOf(e.file)),
+  );
+  const segs = idx.segments.filter((seg) => !off.has(seg.name));
+  if (!segs.length) {
+    throw new Error('索引里只有停用的条目：先把要用的记忆启用，再搜');
+  }
   const docs = segs.map((seg) => ({
     id: seg.id,
     text: `${seg.name} ${seg.keywords || ''} ${seg.heading || ''} ${seg.text}`,
@@ -3291,7 +3300,13 @@ async function autoRecallListener(_payload, next) {
     if (next && isPluginMessage(next) && next.source && next.source.kind === 'plugin:dsh-memory') return decision;
     lastRecallKey = key;
     const t0 = Date.now();
-    const found = await withTimeout(recallForPrompt(prompt), RECALL_TIMEOUT_MS);
+    // 超时就是超时：这一轮直接当没有，晚到的结果不缓存、不排队、不带进下一轮。
+    // 加 catch 是为了不让晚到的 rejection 变成 unhandledRejection（日志里会报噪音）。
+    const task = recallForPrompt(prompt).catch((err) => {
+      logPluginError('auto-recall', err);
+      return null;
+    });
+    const found = await withTimeout(task, RECALL_TIMEOUT_MS);
     const ms = Date.now() - t0;
     if (!found) {
       logRecall({ ms, injected: 0, reason: 'timeout', text: prompt.slice(0, 40) });

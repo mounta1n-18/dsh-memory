@@ -2786,6 +2786,7 @@ function ringProps(data) {
               const ctl = data.control || null;
               const manual = Boolean(ctl && ctl.mode === 'manual');
               const org = data.organize || null;
+              const lastRecall = (data.compress && data.compress.last) || null;
               const activeTier = ctl ? ctl.activeTier : pr ? pr.tier : 1;
               const pendingCount = entries.filter((e) => e.pendingDelete).length;
               const coverRate = rc.total ? Math.round((rc.covered / rc.total) * 100) : 0;
@@ -2900,6 +2901,55 @@ function ringProps(data) {
                       tier: activeTier,
                       onPick: (n) => setControl('manual', n),
                     })
+                  : null,
+                lastRecall
+                  ? h(
+                      'div',
+                      {
+                        title: [
+                          '每次自动召回都写一条记录到 ~/.dsh/memory/.tidy/recall-log.json',
+                          lastRecall.text ? `原话：${lastRecall.text}` : '',
+                        ]
+                          .filter(Boolean)
+                          .join('\n'),
+                        style: {
+                          gridColumn: '1 / -1',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 6,
+                          fontSize: 11,
+                          color: 'var(--dsw-alias-label-secondary)',
+                        },
+                      },
+                      h('span', {
+                        style: {
+                          width: 5,
+                          height: 5,
+                          borderRadius: 9999,
+                          background:
+                            lastRecall.reason === 'injected'
+                              ? 'var(--dsw-alias-brand-primary)'
+                              : lastRecall.reason === 'timeout'
+                                ? '#e2574c'
+                                : 'var(--dsw-alias-border-l2)',
+                        },
+                      }),
+                      h('span', null, `上次召回 ${agoOf(lastRecall.at)}`),
+                      h(
+                        'span',
+                        { style: { opacity: 0.85 } },
+                        lastRecall.reason === 'injected'
+                          ? `注入 ${lastRecall.injected} 条${Array.isArray(lastRecall.names) && lastRecall.names.length ? `：${lastRecall.names.join(' · ')}` : ''}`
+                          : lastRecall.reason === 'timeout'
+                            ? `超时 ${lastRecall.ms}ms，这一轮没有注入（不留到下一轮）`
+                            : lastRecall.reason === 'skip-prompt'
+                              ? '这句话不值得检索（寒暄/命令/太短）'
+                              : `未过门槛${typeof lastRecall.cos === 'number' ? `（最高 cos ${lastRecall.cos.toFixed(2)}）` : ''}`,
+                      ),
+                      typeof lastRecall.ms === 'number' && lastRecall.reason === 'injected'
+                        ? h('span', { style: { opacity: 0.6 } }, `${lastRecall.ms}ms`)
+                        : null,
+                    )
                   : null,
                 org
                   ? h(
