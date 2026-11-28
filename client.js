@@ -250,7 +250,18 @@ window.__ModuleLoader__.load({
      * percent = 这些轮里真有回忆的轮数 / 整圈。
      * 两个量的单位都是「轮」，所以能直接叠在同一圈上。
      */
-    function ringProps(data) {
+    function agoOf(iso) {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return '未知';
+  const mins = Math.max(0, Math.round((Date.now() - t) / 60000));
+  if (mins < 1) return '刚刚';
+  if (mins < 60) return `${mins} 分钟前`;
+  const hs = Math.round(mins / 60);
+  if (hs < 24) return `${hs} 小时前`;
+  return `${Math.round(hs / 24)} 天前`;
+}
+
+function ringProps(data) {
       const every = Number(data && data.compress && data.compress.every) || 100;
       const turns = Number(data && data.turns) || 0;
       const cmp = (data && data.compress) || {};
@@ -2747,6 +2758,7 @@ window.__ModuleLoader__.load({
               const pr = data.prune || null;
               const ctl = data.control || null;
               const manual = Boolean(ctl && ctl.mode === 'manual');
+              const org = data.organize || null;
               const activeTier = ctl ? ctl.activeTier : pr ? pr.tier : 1;
               const pendingCount = entries.filter((e) => e.pendingDelete).length;
               const coverRate = rc.total ? Math.round((rc.covered / rc.total) * 100) : 0;
@@ -2861,6 +2873,37 @@ window.__ModuleLoader__.load({
                       tier: activeTier,
                       onPick: (n) => setControl('manual', n),
                     })
+                  : null,
+                org
+                  ? h(
+                      'div',
+                      {
+                        title: org.error
+                          ? `上次体检失败：${org.error}`
+                          : '每次压缩跑完会自动体检一次：只补关系边，合并/拆分/删除都只出提案',
+                        style: {
+                          gridColumn: '1 / -1',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 6,
+                          fontSize: 11,
+                          color: 'var(--dsw-alias-label-secondary)',
+                          paddingTop: 6,
+                        },
+                      },
+                      h('span', {
+                        style: {
+                          width: 5,
+                          height: 5,
+                          borderRadius: 9999,
+                          background: org.error ? '#e2574c' : 'var(--dsw-alias-brand-primary)',
+                        },
+                      }),
+                      h('span', null, org.error ? '上次体检失败' : `上次体检 ${agoOf(org.at)}`),
+                      org.error
+                        ? null
+                        : h('span', { style: { opacity: 0.8 } }, `合并 ${org.merge} · 拆分 ${org.split} · 删除 ${org.drop} · 补边 ${org.link}`),
+                    )
                   : null,
               );
             })()

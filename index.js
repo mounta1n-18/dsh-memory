@@ -60,6 +60,7 @@ const PID_INTEGRAL_MAX = 0.6; // 抗积分饱和
 const PID_FILE = path.join(TIDY, 'pid.json'); // {turn, integral, prevErr, u, tier, total}
 const CONTROL_FILE = path.join(TIDY, 'control.json'); // {mode:'auto'|'manual', tier:1..6}
 const SEEN_FILE = path.join(TIDY, 'seen.json'); // {名称: 首次见到的轮次}——判「待删除」要先看够 100 轮
+const ORGANIZE_FILE = path.join(TIDY, 'organize.json'); // 上一次体检报告（压缩后自动跑）
 
 function clampNum(x, lo, hi) {
   const n = Number(x);
@@ -2339,6 +2340,10 @@ async function runCompress(reason) {
         .filter(Boolean)
         .join('，'),
     });
+    // 体检不挡压缩：跑完异步做，失败只写 organize.json
+    setTimeout(() => {
+      autoOrganize('compress').catch(() => {});
+    }, 0);
     return { files: written, failures };
   } catch (err) {
     writeJson(COMPRESS, {
@@ -2353,6 +2358,46 @@ async function runCompress(reason) {
     throw err;
   } finally {
     compressRunning = false;
+  }
+}
+
+/**
+ * 2.0 阶段六：压缩跑完之后顺手体检——补关系边、记下待处理的提案。
+ * 只做不破坏信息的事；合并/拆分/删除永远只记成提案，等模型或人来决定。
+ */
+async function autoOrganize(reason = 'compress') {
+  const started = Date.now();
+  try {
+    const out = await organizeMemories({ dryRun: false });
+    const p = out.proposals;
+    const report = {
+      at: new Date().toISOString(),
+      turn: turnCount,
+      reason,
+      merge: p.merge.length,
+      split: p.split.length,
+      drop: p.drop.length,
+      link: p.link.length,
+      applied: Array.isArray(out.applied) ? out.applied.length : 0,
+      degraded: Boolean(out.degraded),
+      ms: Date.now() - started,
+      proposals: {
+        merge: p.merge.slice(0, 10),
+        split: p.split.slice(0, 10),
+        drop: p.drop.slice(0, 10),
+      },
+    };
+    writeJson(ORGANIZE_FILE, report);
+    return report;
+  } catch (err) {
+    writeJson(ORGANIZE_FILE, {
+      at: new Date().toISOString(),
+      turn: turnCount,
+      reason,
+      error: String(err?.message || err).slice(0, 300),
+      ms: Date.now() - started,
+    });
+    return null;
   }
 }
 
@@ -2781,7 +2826,10 @@ function snapshot() {
   const cycleStart = lastTurns === null ? turnCount - (turnCount % COMPRESS_EVERY) : lastTurns;
   const sinceTurns = Math.max(0, turnCount - cycleStart);
 
+  const organize = readJson(ORGANIZE_FILE, null);
+
   return {
+    organize,
     state,
     count,
     detail: st?.detail || '',
@@ -4052,6 +4100,8 @@ export const __test = {
   organizeMemories,
   ORGANIZE_MERGE_COS,
   ORGANIZE_LINK_COS,
+  autoOrganize,
+  ORGANIZE_FILE,
   shouldAutoRecall,
   lastUserTurn,
   recallMessage,

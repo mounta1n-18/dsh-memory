@@ -1730,6 +1730,24 @@ console.log('\n[26] 2.0 整理体检与索引重建（阶段五）');
   eq('契约里仍是 8 个工具（organize/reindex 已实装）', S2.TOOL_NAMES.length, 8);
 }
 
+console.log('\n[27] 2.0 压缩后自动体检（阶段六）');
+{
+  ok('autoOrganize 导出可用', typeof T.autoOrganize === 'function');
+  ok('体检报告文件在 .tidy 下', /organize\.json$/.test(T.ORGANIZE_FILE), T.ORGANIZE_FILE);
+  eq('还没跑过时 snapshot.organize 是 null 或对象', ['object'].includes(typeof (await call(state, '/dsh-memory/status')).body.organize), true);
+
+  const report = await T.autoOrganize('selfcheck');
+  ok('体检能出报告', report && typeof report === 'object');
+  eq('报告记下触发原因', report.reason, 'selfcheck');
+  ['merge', 'split', 'drop', 'link'].forEach((k) => eq(`报告里的 ${k} 是数字`, typeof report[k], 'number'));
+  ok('报告带耗时', typeof report.ms === 'number' && report.ms >= 0);
+  ok('报告写进了 organize.json', fs.existsSync(T.ORGANIZE_FILE) && fs.readFileSync(T.ORGANIZE_FILE, 'utf8').includes('selfcheck'));
+
+  const after = await call(state, '/dsh-memory/status');
+  ok('状态接口带出上次体检', Boolean(after.body.organize) && after.body.organize.reason === 'selfcheck');
+  ok('体检报告不进大纲', !/organize\.json|selfcheck/.test(T.outlineText()));
+}
+
 if (process.env.DUMP_PROMPTS) {
   const inv = await call(state, '/dsh-memory/prompts');
   const lines = [
